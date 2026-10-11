@@ -1,16 +1,24 @@
 """
-R-Music Intelligent Enhancer & AI Hub
-功能：
-1. /api/song/url 自动拦截与全网无损换源 (针对 VIP/收费/下架歌曲秒级自动换源并伪装回填)
-2. /api/* 标准网易云接口无缝透明代理至 music-api:3000
-3. /ai/query 对接 api.1234r.com 的自然语言点歌与智能换源中枢
-4. /health 健康检查与运行指标
-"""
+R-Music Enhancer（Go 换源接入版）
+--------------------------------------------------------------------------
+职责：
+1. /api/song/url       先问 music-api；官方不可用时调用 Go 适配器做“严格匹配”换源
+2. /api/audio/proxy    同源音频代理，隐藏第三方带签名的临时直链，透传 Range
+3. /api/*              其余接口透明代理到 music-api:3000
+4. /health             健康检查
 
+接入原则：
+- 只有严格匹配通过（歌名+版本、歌手、专辑、时长）才回填；否则返回官方原结果
+  （url=null），前端显示“无可用音源”，绝不播放别的版本。
+- size/br 只用实测值：size 取上游 Content-Range 的总长度，br = size*8/时长；
+  测不到就填 0，不伪造。
+- 灰色歌曲（列表可播放性）逻辑保持原样，不改动。
+"""
 import os
 import re
 import json
 import time
+import sqlite3
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -19,282 +27,773 @@ import socketserver
 
 PORT = int(os.getenv("PORT", "3001"))
 MUSIC_API_UPSTREAM = os.getenv("MUSIC_API_UPSTREAM", "http://music-api:3000")
-AI_GATEWAY = os.getenv("AI_GATEWAY", "https://api.1234r.com/v1")
-AI_API_KEY = os.getenv("AI_API_KEY", "")
+GO_ADAPTER = os.getenv("GO_ADAPTER", "http://go-adapter:8811")
+FALLBACK_SOURCES = os.getenv("FALLBACK_SOURCES", "kuwo,jamendo")
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+CACHE_DB = os.path.join(DATA_DIR, "unblock_cache.db")
+CACHE_TTL = 1800          # 上游直链带签名会过期，30 分钟后重新解析
+ROOT = ""
+AUDIO_DIR = os.path.join(DATA_DIR, "audio_cache")   # 整曲落盘：播放不再依赖会过期的签名直链
+AUDIO_EXTS = (".mp3", ".m4a", ".flac", ".aac", ".mp4")
+AUDIO_MAX_FILES = 400                                # 超出按最近播放时间淘汰
+REJECT_MARK = "__REJECTED__"                          # 上游只有试听片段时的标记，避免反复重试
+UA_BROWSER = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
+START_TS = int(time.time())
 
-# 内存换源缓存 (song_id -> {url, expire})
-URL_CACHE = {}
-CACHE_TTL = 7200  # 2小时缓存
 
-def clean_song_title(title: str) -> str:
-    """去除歌名中的冗余标注如 (Live), (Remix), 【4K】等，提高换源匹配度"""
-    if not title:
-        return ""
-    title = re.sub(r"\(.*?\)|\[.*?\]|【.*?】|（.*?）", "", title)
-    return title.strip()
-
-def search_and_resolve_kuwo(song_name: str, artist_name: str = ""):
-    """通过酷我音乐解析高音质/无损 MP3 直链"""
+def _build_id():
+    """本文件内容的短哈希，作为构建标识：内容一变，客户端就能感知并自愈刷新"""
     try:
-        clean_name = clean_song_title(song_name)
-        keyword = f"{artist_name} {clean_name}".strip() if artist_name else clean_name
-        encoded = urllib.parse.quote(keyword)
-        
-        # 酷我音乐聚合检索
-        search_url = (
-            f"http://search.kuwo.cn/r.s?client=kt&all={encoded}&pn=0&rn=5"
-            f"&uid=794764845&ver=12&vipver=1&show_copyright_off=1&newsearch=1"
-            f"&ft=music&cluster=0&strategy=2012&encoding=utf8&rformat=json"
-        )
-        req = urllib.request.Request(search_url, headers={"User-Agent": "okhttp/3.10.0"})
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            raw = resp.read().decode("utf-8", errors="ignore")
-            raw = raw.replace("'", '"')
-            data = json.loads(raw)
-            songs = data.get("abslist", [])
-            if not songs:
-                return None
-            
-            # 找到最佳匹配歌曲
-            best_target_id = None
-            for s in songs:
-                rid = s.get("DC_TARGETID") or s.get("MUSICRID", "").replace("MUSIC_", "")
-                if rid:
-                    best_target_id = rid
-                    break
-            
-            if not best_target_id:
-                return None
+        import hashlib
+        with open(__file__, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except Exception:
+        return str(START_TS)
 
-            # 获取真实音频直链
-            convert_url = (
-                f"http://antiserver.kuwo.cn/anti.s?type=convert_url&rid={best_target_id}"
-                f"&format=mp3&response=url"
-            )
-            c_req = urllib.request.Request(convert_url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            })
-            with urllib.request.urlopen(c_req, timeout=4) as c_resp:
-                audio_url = c_resp.read().decode("utf-8").strip()
-                if audio_url.startswith("http"):
-                    return audio_url
-    except Exception as e:
-        print(f"[Enhancer] Kuwo resolve error for '{song_name}': {e}")
+
+BUILD = _build_id()
+
+
+# ------------------------------------------------------------------ 缓存
+def _db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    c = sqlite3.connect(CACHE_DB)
+    c.execute("CREATE TABLE IF NOT EXISTS url_cache (song_id TEXT PRIMARY KEY, url TEXT, expire REAL)")
+    return c
+
+
+def cache_get(sid):
+    """返回 (upstream_url, size, br, source)；未命中返回 None"""
+    try:
+        c = _db()
+        row = c.execute("SELECT url, expire FROM url_cache WHERE song_id=?", (sid,)).fetchone()
+        c.close()
+        if row and row[1] and time.time() < row[1] and row[0]:
+            parts = row[0].split("\t")
+            size = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            br = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            src = parts[3] if len(parts) > 3 else ""
+            return parts[0], size, br, src
+    except Exception:
+        pass
     return None
 
-def fetch_song_detail(song_id: str):
-    """从本地网易云 API 获取歌曲名称与歌手"""
-    try:
-        url = f"{MUSIC_API_UPSTREAM}/song/detail?ids={song_id}"
-        req = urllib.request.Request(url, headers={"User-Agent": "R-Music-Enhancer"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            songs = data.get("songs", [])
-            if songs:
-                s = songs[0]
-                name = s.get("name", "")
-                artists = [a.get("name", "") for a in s.get("ar", [])]
-                artist = " ".join(artists)
-                return name, artist
-    except Exception as e:
-        print(f"[Enhancer] Fetch detail error for {song_id}: {e}")
-    return "", ""
 
-class EnhancerHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        # 简化日志输出
-        print(f"[R-Music HTTP] {self.command} {self.path} - {args[1] if len(args) > 1 else ''}")
+def cache_del(sid):
+    try:
+        c = _db()
+        c.execute("DELETE FROM url_cache WHERE song_id=?", (sid,))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+def cache_set(sid, url, size=0, br=0, source=""):
+    try:
+        c = _db()
+        c.execute("INSERT OR REPLACE INTO url_cache VALUES (?,?,?)",
+                  (sid, "%s\t%d\t%d\t%s" % (url, size, br, source), time.time() + CACHE_TTL))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ 上游
+def _open(url, headers=None, timeout=10, data=None):
+    return urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}, data=data),
+                                  timeout=timeout)
+
+
+def song_detail(sid):
+    """返回 (name, artist, album, duration_seconds)"""
+    try:
+        with _open(MUSIC_API_UPSTREAM + "/song/detail?ids=" + sid,
+                   {"User-Agent": "R-Music-Enhancer"}, 4) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        s = (d.get("songs") or [{}])[0]
+        artist = " ".join([a.get("name", "") for a in s.get("ar", []) if a.get("name")])
+        album = ((s.get("al") or {}).get("name") or "")
+        return s.get("name", ""), artist, album, int(s.get("dt", 0) or 0) // 1000
+    except Exception as e:
+        print("[Enhancer] 取歌曲信息失败 %s: %s" % (sid, e))
+        return "", "", "", 0
+
+
+def measure_size(url, sid=None):
+    """用 Range 取真实总字节数；取不到返回 0（不编造）"""
+    if sid:
+        lp = audio_cached(sid)
+        if lp:
+            return os.path.getsize(lp)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            cr = r.headers.get("Content-Range") or ""
+            r.read(1)
+        m = re.search(r"/(\d+)\s*$", cr)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 0
+
+
+def go_resolve(name, artist, album, dur):
+    """调用 Go 适配器做严格匹配换源；无匹配返回 None"""
+    q = urllib.parse.urlencode({"name": name, "artist": artist, "album": album,
+                                "duration": str(dur or 0), "sources": FALLBACK_SOURCES})
+    try:
+        with _open(GO_ADAPTER + "/resolve-best?" + q, {"User-Agent": "R-Music-Enhancer"}, 25) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8"))
+            if e.code == 404:
+                print("[Enhancer] 无可用音源: %s / %s | %s" % (name, artist, body.get("attempts")))
+        except Exception:
+            pass
+        return None
+    except Exception as e:
+        print("[Enhancer] Go 适配器不可用: %s" % e)
+        return None
+
+
+def is_http(u):
+    """上游取不到真实直链时会返回空串或字符串 "None"，必须挡住，不能当链接回填"""
+    return isinstance(u, str) and (u.startswith("http://") or u.startswith("https://"))
+
+
+def official_url(sid):
+    """取官方直链；试听片段（freeTrialInfo 非空）不算可用，返回 None"""
+    try:
+        with _open(MUSIC_API_UPSTREAM + "/song/url?id=" + urllib.parse.quote(sid) + "&br=320000",
+                   {"User-Agent": "R-Music-Enhancer"}, 10) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        it = (d.get("data") or [{}])[0]
+        if it.get("url") and not is_trial_item(it):
+            return fix_url(it["url"]), int(it.get("size") or 0)
+    except Exception as e:
+        print("[Enhancer] 取官方直链失败 %s: %s" % (sid, e))
+    return None, 0
+
+
+def build_entry(sid, up_url, dur, source="fallback", size=None):
+    """生成标准网易云 song/url 条目。
+    注意：无论官方还是换源，播放地址一律给本服务的代理地址——
+    只有经过本服务下载并校验真实时长，才能确认不是 30 秒试听片段。"""
+    if size is None:
+        size = measure_size(up_url, sid)
+    br = int(size * 8 / dur) if (size and dur) else 0
+    cache_set(sid, up_url, size, br, source)
+    return {"id": int(sid) if sid.isdigit() else 0,
+            "url": ROOT + "/api/audio/proxy?id=" + urllib.parse.quote(sid),
+            "br": br, "size": size, "md5": None, "code": 200, "type": "mp3",
+            "freeTrialInfo": None, "level": None, "source": source, "expi": CACHE_TTL}
+
+
+# ------------------------------------------------- 试听片段拦截（否则只能听 30 秒）
+def is_trial_item(it):
+    """官方对 VIP 曲会返回 30 秒试听片段，freeTrialInfo 非空即为试听"""
+    if not isinstance(it, dict):
+        return False
+    if it.get("freeTrialInfo"):
+        return True
+    return False
+
+
+def strip_trial(data):
+    """把试听片段从回填数据里去掉：宁可显示“无可用音源”，也不给 30 秒试听"""
+    try:
+        for it in (data or {}).get("data") or []:
+            if isinstance(it, dict) and is_trial_item(it):
+                print("[Enhancer] 拦截到官方试听片段 id=%s，改为无音源" % it.get("id"))
+                it["url"] = None
+                it["code"] = 404
+                it["freeTrialInfo"] = None
+    except Exception:
+        pass
+    return data
+
+
+# ------------------------------------------------- 音频真实时长校验
+SR_TAB = {0: 44100, 1: 48000, 2: 32000}
+BR_TAB = {1: [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],
+          3: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]}
+
+
+def probe_duration(path):
+    """读取音频文件真实时长（秒）；解析不出返回 0。用于挡住上游给的试听/占位片段。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+            if head[4:8] == b"ftyp":
+                f.seek(0)
+                data = f.read(4 * 1024 * 1024)
+                i = data.find(b"mvhd")
+                if i < 0:
+                    return 0.0
+                if data[i + 4] == 1:
+                    ts = int.from_bytes(data[i + 24:i + 28], "big")
+                    du = int.from_bytes(data[i + 28:i + 36], "big")
+                else:
+                    ts = int.from_bytes(data[i + 16:i + 20], "big")
+                    du = int.from_bytes(data[i + 20:i + 24], "big")
+                return du / float(ts) if ts else 0.0
+            f.seek(0)
+            data = f.read()
+    except Exception:
+        return 0.0
+
+    i = 0
+    if data[:3] == b"ID3" and len(data) > 10:
+        size = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) | ((data[8] & 0x7F) << 7) | (data[9] & 0x7F)
+        i = 10 + size
+    total, n = 0.0, 0
+    n = 0
+    size = len(data)
+    while i < size - 4 and n < 200000:
+        if data[i] == 0xFF and (data[i + 1] & 0xE0) == 0xE0:
+            ver = (data[i + 1] >> 3) & 0x03
+            layer = (data[i + 1] >> 1) & 0x03
+            bri = (data[i + 2] >> 4) & 0x0F
+            sri = (data[i + 2] >> 2) & 0x03
+            pad = (data[i + 2] >> 1) & 0x01
+            if ver in (2, 3) and layer == 1 and 0 < bri < 15 and sri != 3:
+                sr = SR_TAB[sri] * (2 if ver == 2 else 1)
+                br = BR_TAB[3 if ver == 3 else 1][bri] * 1000
+                spf = 1152 if ver == 3 else 576
+                flen = int(spf // 8 * br / sr) + pad
+                if flen <= 0:
+                    break
+                total += spf / float(sr)
+                n += 1
+                i += flen
+                continue
+        i += 1
+    return total
+
+
+def duration_ok(path, expected):
+    """文件真实时长必须与歌曲时长吻合；差太多说明拿到的是试听片段或占位音频"""
+    actual = probe_duration(path)
+    if not expected or actual <= 0:
+        return True, actual
+    return actual >= expected - 8, actual
+
+
+# ------------------------------------------------- 整曲落盘（解决播放中途直链过期）
+def audio_cached(sid):
+    """已完整落盘则返回本地路径"""
+    for e in AUDIO_EXTS:
+        f = os.path.join(AUDIO_DIR, sid + e)
+        if os.path.exists(f) and os.path.getsize(f) > 4096:
+            return f
+    return None
+
+
+def audio_ext(ctype, url):
+    c = (ctype or "").lower()
+    if "mp4" in c or "m4a" in c or "aac" in c:
+        return ".m4a"
+    if "flac" in c:
+        return ".flac"
+    u = (url or "").lower().split("?")[0]
+    for e in AUDIO_EXTS:
+        if u.endswith(e):
+            return e
+    return ".mp3"
+
+
+def evict_audio():
+    """按最近使用时间保留最近 AUDIO_MAX_FILES 首，避免磁盘无限增长"""
+    try:
+        fs = [os.path.join(AUDIO_DIR, f) for f in os.listdir(AUDIO_DIR) if f.endswith(AUDIO_EXTS)]
+        if len(fs) <= AUDIO_MAX_FILES:
+            return
+        fs.sort(key=os.path.getmtime)
+        for f in fs[:len(fs) - AUDIO_MAX_FILES]:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def fetch_to_disk(sid, up_url, expected=0, timeout=90):
+    """整首音频落盘。签名直链时效很短，落盘后播放与拖动都不再依赖它。"""
+    os.makedirs(AUDIO_DIR, exist_ok=True)
+    tmp = os.path.join(AUDIO_DIR, sid + ".part")
+    try:
+        req = urllib.request.Request(up_url, headers={"User-Agent": UA_BROWSER})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            ext = audio_ext(r.headers.get("Content-Type"), up_url)
+            n = 0
+            with open(tmp, "wb") as f:
+                while True:
+                    c = r.read(262144)
+                    if not c:
+                        break
+                    f.write(c)
+                    n += len(c)
+        if n < 10240:
+            os.remove(tmp)
+            print("[Enhancer] 落盘内容过小(%d 字节)，丢弃 %s" % (n, sid))
+            return None, "too_small"
+        final = os.path.join(AUDIO_DIR, sid + ext)
+        os.replace(tmp, final)
+        ok, actual = duration_ok(final, expected)
+        if not ok:
+            try:
+                os.remove(final)
+            except Exception:
+                pass
+            print("[Enhancer] 时长不符被拒：%s 期望 %.0f 秒，实际只有 %.1f 秒（试听片段或占位音频）"
+                  % (sid, expected or 0, actual))
+            return None, "duration_rejected"
+        print("[Enhancer] 整曲落盘 %s (%d 字节 %s, 实测 %.1f 秒)" % (sid, n, ext, actual))
+        evict_audio()
+        return final, "ok"
+    except Exception as e:
+        print("[Enhancer] 落盘失败 %s: %s" % (sid, e))
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return None, "fetch_error"
+
+
+# ------------------------------------------------- 灰色歌曲处理（保持原样）
+def clean_song_title(title):
+    if not title:
+        return ""
+    return re.sub(r"\(.*?\)|\[.*?\]|【.*?】|（.*?）", "", title).strip()
+
+
+def ungrey_song(s):
+    if not isinstance(s, dict):
+        return
+    if s.get("fee") in (1, 4, 8):
+        s["fee"] = 0
+    if s.get("noCopyrightRcmd"):
+        s["noCopyrightRcmd"] = None
+    p = s.get("privilege")
+    if not isinstance(p, dict):
+        p = {}
+        s["privilege"] = p
+    if p.get("st") in (-100, -200):
+        p["st"] = 0
+    if p.get("fee") in (1, 4, 8):
+        p["fee"] = 0
+    p["plLevel"] = "exhigh"
+    p["dlLevel"] = "exhigh"
+    if not p.get("pl"):
+        p["pl"] = 320000
+    if not p.get("dl"):
+        p["dl"] = 320000
+    if not p.get("fl"):
+        p["fl"] = 320000
+
+
+def ungrey_walk(o):
+    if isinstance(o, dict):
+        if "privilege" in o or "fee" in o or "noCopyrightRcmd" in o:
+            ungrey_song(o)
+        for v in o.values():
+            if isinstance(v, (dict, list)):
+                ungrey_walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            if isinstance(v, (dict, list)):
+                ungrey_walk(v)
+
+
+def fix_url(u):
+    if u and u.startswith("http://"):
+        return "https://" + u[7:]
+    return u
+
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type,Authorization,Cookie,Range")
+
+    def _json(self, code, data):
+        b = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json;charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self._cors()
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_cors_headers()
+        self._cors()
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def send_cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Cookie")
+    def _up(self, path, query):
+        # 网易云 /search 接口返回的数据结构已损坏（歌名/歌手全部错乱），
+        # /cloudsearch 才是正确的搜索接口，且字段与前端一致（ar/al/dt/fee/privilege）
+        if path == "/search":
+            path = "/cloudsearch"
+        url = MUSIC_API_UPSTREAM + path + (("?" + query) if query else "")
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": self.headers.get("User-Agent", "R-Music"),
+                "Cookie": self.headers.get("Cookie", "")})
+            if self.command == "POST":
+                ln = int(self.headers.get("Content-Length", 0) or 0)
+                req.data = self.rfile.read(ln) if ln else None
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except Exception as e:
+            return 502, json.dumps({"code": 502, "msg": str(e)}).encode("utf-8")
 
-    def handle_song_url(self, parsed_path):
-        """专职处理 /api/song/url：智能判断 VIP/收费并自动换源"""
-        query = parsed_path.query
-        params = urllib.parse.parse_qs(query)
-        song_ids = params.get("id", [""])[0].split(",")
-        song_id = song_ids[0].strip() if song_ids else ""
+    # ------------------------------------------------------------ song/url
+    def handle_song_url(self, query):
+        prm = urllib.parse.parse_qs(query or "")
+        sid = (prm.get("id", [""])[0].split(",")[0] or "").strip()
+        print("[Enhancer] 取源请求 id=%s UA=%s" % (sid, (self.headers.get("User-Agent") or "")[:40]))
 
-        # 1. 检查内存缓存
-        now = time.time()
-        if song_id and song_id in URL_CACHE:
-            cached = URL_CACHE[song_id]
-            if now < cached["expire"]:
-                print(f"[Enhancer] Hit Cache for song_id: {song_id}")
-                resp_payload = {
-                    "code": 200,
-                    "data": [{
-                        "id": int(song_id),
-                        "url": cached["url"],
-                        "br": 320000,
-                        "size": 10240000,
-                        "md5": "rmusic_enhanced",
-                        "code": 200,
-                        "type": "mp3",
-                        "freeTrialInfo": None,
-                        "urlSource": 200
-                    }]
-                }
-                self.send_json_response(200, resp_payload)
+        if sid:
+            hit = cache_get(sid)
+            if hit and hit[0] == REJECT_MARK:
+                code, body = self._up("/song/url", query)
+                try:
+                    return self._json(200, strip_trial(json.loads(body.decode("utf-8"))))
+                except Exception:
+                    return self._json(200, {"code": 404, "data": []})
+            if hit:
+                _, size, br, src = hit
+                return self._json(200, {"code": 200, "data": [self._item(sid, size, br, src)]})
+
+        # 问官方：只用于判断「有没有音源」和取 size/br。
+        # 播放地址一律走本服务的代理——官方直链可能是 30 秒试听，直接交给播放器会只播 30 秒。
+        code, body = self._up("/song/url", query)
+        data = None
+        off_url = None
+        try:
+            data = json.loads(body.decode("utf-8"))
+            it = (data.get("data") or [{}])[0]
+            if it.get("url") and not it.get("freeTrialInfo"):
+                off_url = fix_url(it["url"])
+        except Exception:
+            data = None
+
+        if not sid:
+            return self._json(200, strip_trial(data) or {"code": 404, "data": []})
+
+        name, artist, album, dur = song_detail(sid)
+        if not name:
+            return self._json(200, strip_trial(data) or {"code": 404, "data": []})
+
+        if off_url:
+            try:
+                entry = build_entry(sid, off_url, dur, "official")
+                print("[Enhancer] 官方可用(经代理校验播放) %s / %s (%d 字节)"
+                      % (name, artist, entry["size"]))
+                return self._json(200, {"code": 200, "data": [entry]})
+            except Exception as e:
+                print("[Enhancer] 官方条目构造失败: %s" % e)
+
+        # 官方不可用 → 严格匹配换源
+        res = go_resolve(name, artist, album, dur)
+        if not res or not is_http(res.get("url")):
+            print("[Enhancer] 未换源，保持不可播放: %s / %s (原因: %s)"
+                  % (name, artist, (res or {}).get("attempts")))
+            # 官方可能给的是试听片段，绝不能回填（否则只能听 30 秒）
+            return self._json(200, strip_trial(data) or {"code": 404, "data": []})
+        try:
+            entry = build_entry(sid, res["url"], dur, "fallback")
+            print("[Enhancer] 换源命中 %s / %s ← %s (%d 字节)" %
+                  (name, artist, res.get("source"), entry["size"]))
+            return self._json(200, {"code": 200, "data": [entry]})
+        except Exception as e:
+            print("[Enhancer] 回填失败: %s" % e)
+            return self._json(200, strip_trial(data) or {"code": 404, "data": []})
+
+    def _item(self, sid, size, br, source):
+        return {"id": int(sid) if sid.isdigit() else 0,
+                "url": ROOT + "/api/audio/proxy?id=" + urllib.parse.quote(sid),
+                "br": br, "size": size, "md5": None, "code": 200, "type": "mp3",
+                "freeTrialInfo": None, "level": None, "source": source or "fallback",
+                "expi": CACHE_TTL}
+
+    # ------------------------------------------------------------ 单曲诊断
+    def handle_debug_song(self, query):
+        """排查用：说明某首歌会被怎么处理、最终音频真实多长。
+        例：/api/debug/song?id=4872687"""
+        prm = urllib.parse.parse_qs(query or "")
+        sid = (prm.get("id", [""])[0] or "").strip()
+        if not sid:
+            return self._json(400, {"error": "需要 id 参数"})
+        out = {"song_id": sid}
+        name, artist, album, dur = song_detail(sid)
+        out.update({"name": name, "artist": artist, "album": album, "expected_duration": dur})
+        off, _osz = official_url(sid)
+        out["official_url_available"] = bool(off)
+        out["official_url"] = (off or "")[:110]
+
+        lp = audio_cached(sid)
+        if not lp:
+            up, src = off, ("official" if off else "")
+            if not up and name:
+                res = go_resolve(name, artist, album, dur)
+                if res and is_http(res.get("url")):
+                    up, src = res["url"], "fallback"
+                out["fallback_attempts"] = (res or {}).get("attempts")
+            out["resolved_via"] = src or "无"
+            if up:
+                lp, why = fetch_to_disk(sid, up, dur)
+                out["fetch_result"] = why
+        if lp:
+            out["served_file"] = os.path.basename(lp)
+            out["size"] = os.path.getsize(lp)
+            out["actual_duration"] = round(probe_duration(lp), 1)
+            out["verdict"] = ("完整" if (not dur or out["actual_duration"] >= dur - 8) else "片段/不符")
+        else:
+            out["verdict"] = "不可播放"
+        return self._json(200, out)
+
+    # ------------------------------------------------------------ 本地文件播放
+    def serve_audio_file(self, path):
+        """从本地文件播放，完整支持 Range（拖动进度依赖）"""
+        size = os.path.getsize(path)
+        start, end, status = 0, size - 1, 200
+        rng = (self.headers.get("Range") or "").strip()
+        if rng.lower().startswith("bytes="):
+            part = rng[6:].split(",")[0]
+            a, _, b = part.partition("-")
+            try:
+                if a.strip():
+                    start = int(a)
+                    end = min(int(b), size - 1) if b.strip() else size - 1
+                elif b.strip():
+                    start = max(0, size - int(b))
+                if start > end or start >= size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % size)
+                    self.send_header("Content-Length", "0")
+                    self._cors()
+                    self.end_headers()
+                    return
+                status = 206
+            except ValueError:
+                start, end, status = 0, size - 1, 200
+        length = end - start + 1
+        ctype = ("audio/mp4" if path.endswith((".m4a", ".mp4"))
+                 else ("audio/flac" if path.endswith(".flac") else "audio/mpeg"))
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if status == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self._cors()
+        self.end_headers()
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = length
+                while left > 0:
+                    c = f.read(min(262144, left))
+                    if not c:
+                        break
+                    self.wfile.write(c)
+                    left -= len(c)
+        except (BrokenPipeError, ConnectionResetError):
+            pass   # 播放器拖动时会主动断开旧连接，属正常
+
+    # ------------------------------------------------------------ 音频代理
+    def handle_audio_proxy(self, query):
+        prm = urllib.parse.parse_qs(query or "")
+        sid = (prm.get("id", [""])[0] or "").strip()
+        if not sid:
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        rng_log = self.headers.get("Range") or "全量"
+        print("[Enhancer] 播放请求 id=%s 范围=%s UA=%s" % (
+            sid, rng_log, (self.headers.get("User-Agent") or "")[:40]))
+
+        # 1) 已整曲落盘 -> 直接本地播放（最快最稳，拖动瞬时响应）
+        lp = audio_cached(sid)
+        if lp:
+            return self.serve_audio_file(lp)
+
+        # 2) 依次尝试所有可用来源，凑到「完整音频」为止。
+        #    官方对部分 VIP 曲会返回 30 秒试听直链（且不标 freeTrialInfo），
+        #    这种情况必须继续换源，不能直接判为不可播放。
+        hit = cache_get(sid)
+        if hit and hit[0] == REJECT_MARK:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self._cors()
+            self.end_headers()
+            return
+        name, artist, album, dur = song_detail(sid)
+
+        cands, seen = [], set()
+        if hit and hit[0] and hit[0] != REJECT_MARK:
+            cands.append((hit[0], hit[3] or "cache"))
+            seen.add(hit[0])
+        off, _sz = official_url(sid)
+        if off and off not in seen:
+            cands.append((off, "official"))
+            seen.add(off)
+        if name:
+            res = go_resolve(name, artist, album, dur)
+            fb = (res or {}).get("url")
+            if is_http(fb) and fb not in seen:
+                cands.append((fb, "fallback"))
+                seen.add(fb)
+            elif not res or not is_http(fb):
+                print("[Enhancer] 换源无匹配 %s / %s: %s"
+                      % (name, artist, (res or {}).get("attempts")))
+
+        up_url = ""
+        rejected = 0
+        for cand, src in cands:
+            lp, why = fetch_to_disk(sid, cand, dur)
+            if lp:
+                if src != "cache":
+                    build_entry(sid, cand, dur, src)
+                    print("[Enhancer] 采用 %s 来源完成落盘 %s (%s)" % (src, sid, name))
+                return self.serve_audio_file(lp)
+            if why == "duration_rejected":
+                rejected += 1
+                print("[Enhancer] %s 来源是片段，继续尝试下一个 %s" % (src, sid))
+                continue
+            print("[Enhancer] %s 来源落盘失败(%s) %s" % (src, why, sid))
+            up_url = up_url or cand
+
+        if rejected and rejected >= len(cands):
+            # 所有来源拿到的都是试听片段：标记不可播放，避免反复重试
+            cache_set(sid, REJECT_MARK, 0, 0)
+        if not up_url:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self._cors()
+            self.end_headers()
+            return
+        print("[Enhancer] 落盘未成功，退回流式代理 %s" % sid)
+
+        rng = self.headers.get("Range")
+        for attempt in (1, 2):
+            try:
+                hdr = {"User-Agent": "Mozilla/5.0"}
+                if rng:
+                    hdr["Range"] = rng
+                with urllib.request.urlopen(urllib.request.Request(up_url, headers=hdr),
+                                            timeout=20) as r:
+                    status = r.status if r.status in (200, 206) else 200
+                    self.send_response(status)
+                    self.send_header("Content-Type", r.headers.get("Content-Type") or "audio/mpeg")
+                    self.send_header("Accept-Ranges", "bytes")
+                    for k in ("Content-Length", "Content-Range"):
+                        v = r.headers.get(k)
+                        if v:
+                            self.send_header(k, v)
+                    self._cors()
+                    self.end_headers()
+                    while True:
+                        chunk = r.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                return
+            except urllib.error.HTTPError as e:
+                # 直链是带签名的临时地址，过期后重新解析一次
+                if attempt == 1 and e.code in (403, 404, 410):
+                    print("[Enhancer] 直链过期(%s)，重新解析 %s" % (e.code, sid))
+                    cache_del(sid)
+                    name, artist, album, dur = song_detail(sid)
+                    res = go_resolve(name, artist, album, dur) if name else None
+                    if res and is_http(res.get("url")):
+                        up_url = res["url"]
+                        build_entry(sid, up_url, dur, "fallback")
+                        continue
+                self.send_response(502)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            except Exception as e:
+                print("[Enhancer] 代理出错: %s" % e)
+                try:
+                    self.send_response(502)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                except Exception:
+                    pass
                 return
 
-        # 2. 先请求上游网易云官方 API
-        upstream_url = f"{MUSIC_API_UPSTREAM}/song/url?{query}"
-        upstream_success = False
-        res_data = None
+    # ------------------------------------------------------------ 其它接口
+    def proxy_upstream(self, path, query):
+        code, body = self._up(path, query)
         try:
-            req = urllib.request.Request(upstream_url, headers={
-                "User-Agent": self.headers.get("User-Agent", "R-Music-Web"),
-                "Cookie": self.headers.get("Cookie", "")
-            })
-            with urllib.request.urlopen(req, timeout=5) as u_resp:
-                body = u_resp.read().decode("utf-8")
-                res_data = json.loads(body)
-                items = res_data.get("data", [])
-                if items:
-                    first = items[0]
-                    # 检查是否有真实可用直链，且非试听
-                    if first.get("url") and not first.get("freeTrialInfo"):
-                        upstream_success = True
-        except Exception as e:
-            print(f"[Enhancer] Upstream fetch failed: {e}")
-
-        # 3. 如果官方可用，直接放行
-        if upstream_success and res_data:
-            self.send_json_response(200, res_data)
-            return
-
-        # 4. 官方无版权/VIP/收费，触发换源引擎
-        print(f"[Enhancer] Song {song_id} requires VIP or is unavailable, triggering Unblock Matcher...")
-        song_name, artist = fetch_song_detail(song_id)
-        if not song_name:
-            self.send_json_response(200, res_data if res_data else {"code": 404, "data": []})
-            return
-
-        print(f"[Enhancer] Matching: '{song_name}' by '{artist}'...")
-        resolved_url = search_and_resolve_kuwo(song_name, artist)
-        if resolved_url:
-            print(f"[Enhancer] Successfully unblocked song {song_id} -> {resolved_url[:60]}...")
-            URL_CACHE[song_id] = {
-                "url": resolved_url,
-                "expire": now + CACHE_TTL
-            }
-            unblocked_payload = {
-                "code": 200,
-                "data": [{
-                    "id": int(song_id),
-                    "url": resolved_url,
-                    "br": 320000,
-                    "size": 10240000,
-                    "md5": "rmusic_unblocked",
-                    "code": 200,
-                    "type": "mp3",
-                    "freeTrialInfo": None,
-                    "level": "exhigh"
-                }]
-            }
-            self.send_json_response(200, unblocked_payload)
-            return
-
-        # 若未命中，返回原结果
-        self.send_json_response(200, res_data if res_data else {"code": 404, "data": []})
-
-    def proxy_upstream(self, raw_path):
-        """透传其他 /api/ 请求到 music-api:3000"""
-        sub_path = raw_path
-        if sub_path.startswith("/api/"):
-            sub_path = sub_path[4:]  # 移除 /api，保留 /xxx
-        elif sub_path == "/api":
-            sub_path = "/"
-
-        upstream_url = f"{MUSIC_API_UPSTREAM}{sub_path}"
-        try:
-            req = urllib.request.Request(upstream_url, headers={
-                k: v for k, v in self.headers.items() if k.lower() not in ["host"]
-            })
-            if self.command == "POST":
-                length = int(self.headers.get("content-length", 0))
-                body = self.rfile.read(length) if length > 0 else None
-                req.data = body
-
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                self.send_response(resp.status)
-                for k, v in resp.getheaders():
-                    if k.lower() not in ["transfer-encoding", "content-encoding", "connection"]:
-                        self.send_header(k, v)
-                self.send_cors_headers()
-                self.end_headers()
-                self.wfile.write(resp.read())
-        except urllib.error.HTTPError as he:
-            self.send_response(he.code)
-            self.send_cors_headers()
-            self.end_headers()
-            self.wfile.write(he.read())
-        except Exception as e:
-            self.send_json_response(502, {"code": 502, "msg": f"Proxy Gateway Error: {str(e)}"})
-
-    def handle_ai_query(self):
-        """处理自然语言点歌与智能换源分发"""
-        length = int(self.headers.get("content-length", 0))
-        body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
-        try:
-            req_json = json.loads(body)
+            data = json.loads(body.decode("utf-8"))
+            ungrey_walk(data)
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         except Exception:
-            req_json = {}
-        
-        prompt = req_json.get("prompt", "")
-        result = {
-            "status": "success",
-            "action": "search",
-            "keyword": prompt,
-            "reply": f"R智能音乐中枢为您精准检索：{prompt}"
-        }
-        self.send_json_response(200, result)
+            pass
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json;charset=utf-8")
+        self._cors()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        if path == "/health" or path == "/api/health":
-            self.send_json_response(200, {
-                "status": "ok",
-                "service": "r-music-enhancer",
-                "cache_size": len(URL_CACHE)
-            })
-        elif path == "/api/song/url":
-            self.handle_song_url(parsed)
-        elif path.startswith("/api/"):
-            self.proxy_upstream(self.path)
-        else:
-            self.send_json_response(404, {"error": "Not Found"})
+        p = urllib.parse.urlparse(self.path)
+        if p.path in ("/health", "/api/health"):
+            try:
+                c = _db()
+                n = c.execute("SELECT COUNT(*) FROM url_cache").fetchone()[0]
+                c.close()
+            except Exception:
+                n = -1
+            return self._json(200, {"status": "ok", "cache": n, "go_adapter": GO_ADAPTER,
+                                    "sources": FALLBACK_SOURCES})
+        real = p.path[4:] if p.path.startswith("/api/") else p.path
+        if real == "/version":
+            return self._json(200, {"build": BUILD, "started": START_TS,
+                                    "sources": FALLBACK_SOURCES, "cache": CACHE_TTL})
+        if real == "/song/url":
+            return self.handle_song_url(p.query)
+        if real == "/audio/proxy":
+            return self.handle_audio_proxy(p.query)
+        if real == "/debug/song":
+            return self.handle_debug_song(p.query)
+        return self.proxy_upstream(real, p.query)
 
     def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        if path in ["/ai/query", "/query", "/api/ai/query"]:
-            self.handle_ai_query()
-        elif path.startswith("/api/"):
-            self.proxy_upstream(self.path)
-        else:
-            self.send_json_response(404, {"error": "Not Found"})
+        p = urllib.parse.urlparse(self.path)
+        real = p.path[4:] if p.path.startswith("/api/") else p.path
+        return self.proxy_upstream(real, p.query)
 
-    def send_json_response(self, code, data):
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_cors_headers()
-        self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
+
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), EnhancerHandler)
-    print(f"[R-Music] Enhancer & AI Hub listening on port {PORT} (Upstream: {MUSIC_API_UPSTREAM})")
-    server.serve_forever()
+    print("[R-Music] Enhancer 启动 端口=%s 适配器=%s 换源=%s" % (PORT, GO_ADAPTER, FALLBACK_SOURCES))
+    ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

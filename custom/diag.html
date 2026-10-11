@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>R-Music 播放诊断</title>
+<style>
+  body{margin:0;padding:14px;background:#101317;color:#e8eef6;
+       font:15px/1.7 -apple-system,"PingFang SC",sans-serif}
+  h1{font-size:19px;margin:0 0 10px}
+  #out{font-size:18px;line-height:1.9;white-space:pre-wrap;word-break:break-all}
+  .ok{color:#5ef08a;font-weight:700}
+  .bad{color:#ff8f8f;font-weight:700}
+  audio{width:100%;margin-top:14px}
+</style>
+</head>
+<body>
+<h1>R-Music 播放诊断</h1>
+<div id="out">正在诊断…</div>
+<audio id="a" controls preload="auto"></audio>
+<script>
+(function () {
+  var ID = new URLSearchParams(location.search).get('id') || '4872687';
+  var out = document.getElementById('out'), a = document.getElementById('a'), L = [];
+  function log(s) { L.push(s); out.textContent = L.join('\n'); }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  fetch('/api/song/url?id=' + ID + '&br=320000&_=' + Date.now())
+    .then(function (r) { return r.json(); })
+    .then(function (r) {
+      var it = (r.data || [])[0] || {};
+      log('歌曲ID: ' + ID);
+      log('取源地址: ' + (it.url || '(无)'));
+      log('来源: ' + (it.source || '-') + '   声明字节: ' + (it.size || 0));
+      if (!it.url) { log('结论: 无音源'); return; }
+      a.src = it.url;
+      return a.play().then(function () { return null; }, function (e) { log('播放被浏览器拦: ' + e); });
+    })
+    .then(function () {
+      return sleep(2500);
+    })
+    .then(function () {
+      log('');
+      log('① 浏览器识别时长: ' + (a.duration ? a.duration.toFixed(2) : '未知') + ' 秒');
+      a.currentTime = 60;
+      return sleep(3000);
+    })
+    .then(function () {
+      log('② 跳到 60 秒后 currentTime = ' + a.currentTime.toFixed(2) + ' 秒');
+      a.currentTime = Math.max(0, a.duration - 6);
+      return sleep(9000);
+    })
+    .then(function () {
+      log('③ 结尾前 6 秒后 currentTime = ' + a.currentTime.toFixed(2) +
+          ' / ' + a.duration.toFixed(2) + ' 秒');
+      log('');
+      if (a.currentTime >= a.duration - 1.5 && a.duration > 60) {
+        log('结论: 完整播放 ✔（时长 ' + a.duration.toFixed(0) + ' 秒，可播到结尾）');
+      } else if (a.duration <= 60) {
+        log('结论: 拿到的是短音频 ✘（只有 ' + a.duration.toFixed(0) + ' 秒）');
+      } else {
+        log('结论: 未能播到结尾 ✘（停在 ' + a.currentTime.toFixed(0) + ' 秒）');
+      }
+    })
+    .catch(function (e) { log('出错: ' + e); });
+})();
+</script>
+</body>
+</html>

@@ -25,6 +25,7 @@ services:
     depends_on:
       - enhancer
 
+  # 换源接入层：官方可用则直通；官方面不可用时调用 Go 适配器做严格匹配换源
   enhancer:
     image: python:3.11-alpine
     container_name: music-enhancer
@@ -32,12 +33,15 @@ services:
     working_dir: /app
     volumes:
       - ./ai_service/server.py:/app/server.py:ro
+      - ./data:/data
     command: ["python", "-u", "/app/server.py"]
     environment:
       - TZ=Asia/Tokyo
       - PORT=3001
       - MUSIC_API_UPSTREAM=http://music-api:3000
-      - AI_GATEWAY=https://api.1234r.com/v1
+      - GO_ADAPTER=http://go-adapter:8811
+      - FALLBACK_SOURCES=kuwo,jamendo
+      - DATA_DIR=/data
     deploy:
       resources:
         limits:
@@ -47,6 +51,34 @@ services:
       - traefik
     depends_on:
       - api
+      - go-adapter
+
+  # Go-Music-DL 严格匹配换源适配器（私有 sidecar，不发布端口）
+  # 取直链必须经国内出口（酷我等国内平台的签名直链只对国内 IP 有效），
+  # 走宿主机上 music-cn-relay.service 提供的 SOCKS5；音频文件本身东京可直连，无需代理。
+  go-adapter:
+    build: ./go-adapter
+    image: r-music-go-adapter:1
+    container_name: music-go-adapter
+    restart: always
+    working_dir: /data
+    volumes:
+      - ./data/go-adapter:/data
+    environment:
+      - TZ=Asia/Tokyo
+      # 必须同时设置 HTTP_ 与 HTTPS_（取链接口走 HTTPS），否则代理不生效
+      - HTTP_PROXY=socks5h://172.19.0.1:11080
+      - HTTPS_PROXY=socks5h://172.19.0.1:11080
+      # 海外音源直连更快，且避免国内机器访问受限时反而拖慢
+      - NO_PROXY=localhost,127.0.0.1,.jamendo.com
+      - no_proxy=localhost,127.0.0.1,.jamendo.com
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    networks:
+      - traefik
 
   api:
     image: binaryify/netease_cloud_music_api:latest

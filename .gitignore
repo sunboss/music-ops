@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv*/
+venv/
+
+# 本地数据与缓存
+data/
+*.part
+
+# 编译产物（部署时现场构建或随包上传，不进仓库）
+go-adapter/adapter
+go-adapter/adapter-linux-amd64
+go-adapter/diag-macos
+go-adapter/diag-linux-amd64
+go-music-dl-phase2/
+
+# macOS
+.DS_Store
