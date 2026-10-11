@@ -1,0 +1,492 @@
+/* ==========================================================================
+   R-Music 现代化主题、全端自适应与投屏增强样式包 (Upgrade-safe Zero-intrusion)
+   ========================================================================== */
+
+:root {
+  --rm-accent: #00F2FE;
+  --rm-accent-purple: #7F00FF;
+  --rm-blur-bg: rgba(255, 255, 255, 0.76);
+  --rm-blur-dark: rgba(22, 22, 28, 0.82);
+  --rm-glass-border: rgba(255, 255, 255, 0.14);
+  --rm-radius-card: 16px;
+  --rm-radius-modal: 22px;
+  --rm-transition: all 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+  --rm-shadow-glow: 0 8px 32px rgba(0, 242, 254, 0.18);
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 现代化全局极简滚动条 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(140, 140, 145, 0.35);
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(140, 140, 145, 0.65);
+}
+
+/* ==========================================================================
+   1. 品牌专属 Logo 与顶部导航栏美化
+   ========================================================================== */
+nav {
+  backdrop-filter: blur(28px) saturate(190%) !important;
+  -webkit-backdrop-filter: blur(28px) saturate(190%) !important;
+  transition: var(--rm-transition) !important;
+  z-index: 100 !important;
+}
+
+.r-music-brand {
+  display: flex;
+  align-items: center;
+  margin-right: 18px;
+  flex-shrink: 0;
+}
+
+.r-music-logo-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+  cursor: pointer;
+  transition: var(--rm-transition);
+}
+
+.r-music-logo-link:hover {
+  transform: translateY(-1px) scale(1.02);
+}
+
+.r-music-logo-img {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0, 242, 254, 0.28);
+  object-fit: cover;
+}
+
+.r-music-brand-text {
+  font-size: 19px;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  background: linear-gradient(135deg, #00F2FE 0%, #4FACFE 45%, #7F00FF 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  display: inline-block;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+nav .navigation-search input {
+  transition: var(--rm-transition) !important;
+  border-radius: 20px !important;
+}
+
+nav .navigation-search input:focus {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 18px rgba(0, 242, 254, 0.2) !important;
+}
+
+/* ==========================================================================
+   2. 卡片与推荐歌单封面动效强化
+   ========================================================================== */
+.cover-row .item {
+  transition: var(--rm-transition) !important;
+}
+
+.cover-row .item .cover-container {
+  border-radius: var(--rm-radius-card) !important;
+  overflow: hidden !important;
+  box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.08) !important;
+  transition: var(--rm-transition) !important;
+}
+
+.cover-row .item:hover .cover-container {
+  transform: translateY(-5px) scale(1.03);
+  box-shadow: 0 16px 36px -6px rgba(0, 0, 0, 0.2), 0 0 16px rgba(0, 242, 254, 0.18) !important;
+}
+
+.daily-recommend-card, .fm-card {
+  border-radius: var(--rm-radius-card) !important;
+  box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.1) !important;
+  transition: var(--rm-transition) !important;
+}
+
+.daily-recommend-card:hover, .fm-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 14px 32px -4px rgba(0, 0, 0, 0.18) !important;
+}
+
+/* ==========================================================================
+   3. 底部播放条质感与投屏 (AirPlay & DLNA) 控件
+   ========================================================================== */
+.player {
+  backdrop-filter: blur(28px) saturate(190%) !important;
+  -webkit-backdrop-filter: blur(28px) saturate(190%) !important;
+  border-top: 1px solid var(--rm-glass-border) !important;
+  box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.08) !important;
+  transition: var(--rm-transition) !important;
+  z-index: 99 !important;
+}
+
+/* 投屏触发按钮 */
+.r-music-cast-trigger {
+  background: transparent;
+  border: none;
+  outline: none;
+  cursor: pointer;
+  padding: 8px;
+  margin: 0 4px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  color: var(--color-text, rgba(255, 255, 255, 0.82));
+  transition: var(--rm-transition);
+}
+
+.r-music-cast-trigger:hover {
+  transform: scale(1.15);
+  background: rgba(140, 140, 145, 0.15);
+  color: #00F2FE !important;
+}
+
+.r-music-cast-trigger:active {
+  transform: scale(0.92);
+}
+
+.cast-status-indicator {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #00F2FE;
+  box-shadow: 0 0 8px #00F2FE;
+  display: none;
+}
+
+.r-music-cast-trigger.active .cast-status-indicator {
+  display: block;
+}
+
+/* 投屏弹窗 (AirPlay & DLNA Modal) */
+.r-music-cast-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 99999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.r-music-cast-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.r-music-cast-content {
+  position: relative;
+  background: var(--rm-blur-dark);
+  color: #FFFFFF;
+  border: 1px solid var(--rm-glass-border);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.4), var(--rm-shadow-glow);
+  width: 90%;
+  max-width: 480px;
+  border-radius: var(--rm-radius-modal);
+  padding: 24px;
+  backdrop-filter: blur(32px) saturate(180%);
+  -webkit-backdrop-filter: blur(32px) saturate(180%);
+  animation: rmCastPop 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes rmCastPop {
+  0% { opacity: 0; transform: scale(0.92) translateY(16px); }
+  100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.r-music-cast-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  padding-bottom: 14px;
+}
+
+.r-music-cast-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 17px;
+  font-weight: 700;
+  color: #00F2FE;
+}
+
+.r-music-cast-close {
+  background: transparent;
+  border: none;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 26px;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0 4px;
+  transition: var(--rm-transition);
+}
+
+.r-music-cast-close:hover {
+  color: #FFFFFF;
+  transform: rotate(90deg);
+}
+
+.cast-track-info {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 14px;
+  padding: 14px 16px;
+  margin-bottom: 20px;
+}
+
+.cast-track-name {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cast-track-status {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.cast-action-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.cast-action-btn {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+  padding: 14px 18px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+  transition: var(--rm-transition);
+  text-align: left;
+}
+
+.cast-action-btn.primary {
+  background: linear-gradient(135deg, rgba(0, 242, 254, 0.22) 0%, rgba(127, 0, 255, 0.25) 100%);
+  color: #FFFFFF;
+  border-color: rgba(0, 242, 254, 0.35);
+}
+
+.cast-action-btn.primary:hover {
+  transform: translateY(-2px);
+  background: linear-gradient(135deg, rgba(0, 242, 254, 0.35) 0%, rgba(127, 0, 255, 0.4) 100%);
+  box-shadow: 0 8px 24px rgba(0, 242, 254, 0.25);
+}
+
+.cast-action-btn.secondary {
+  background: rgba(255, 255, 255, 0.08);
+  color: #FFFFFF;
+}
+
+.cast-action-btn.secondary:hover {
+  transform: translateY(-2px);
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.cast-action-btn .btn-text strong {
+  display: block;
+  font-size: 15px;
+  margin-bottom: 3px;
+}
+
+.cast-action-btn .btn-text span {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.cast-hint-box {
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.75);
+  line-height: 1.6;
+}
+
+.cast-hint-box ul {
+  margin: 6px 0 0 16px;
+  padding: 0;
+}
+
+/* ==========================================================================
+   4. 全端多尺寸与手机自适应深度优化 (Mobile First Response)
+   ========================================================================== */
+
+/* 手机及窄屏端 (<= 768px) */
+@media (max-width: 768px) {
+  html, body {
+    overflow-x: hidden !important;
+    -webkit-text-size-adjust: 100% !important;
+    min-width: 0 !important;
+  }
+  #app {
+    min-width: 0 !important;
+  }
+
+  /* 导航栏自适应 */
+  nav {
+    padding: 6px 12px !important;
+    height: 52px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+  }
+  .r-music-brand {
+    margin-right: 8px !important;
+  }
+  .r-music-brand-text {
+    font-size: 16px !important;
+  }
+  .r-music-logo-img {
+    width: 26px !important;
+    height: 26px !important;
+  }
+
+  .navigation-buttons {
+    display: none !important;
+  }
+  .navigation-links {
+    display: flex !important;
+    flex-wrap: nowrap !important;
+    gap: 10px !important;
+    overflow-x: auto !important;
+    scrollbar-width: none;
+  }
+  .navigation-links::-webkit-scrollbar {
+    display: none;
+  }
+  .navigation-links a {
+    white-space: nowrap !important;
+    font-size: 13px !important;
+    padding: 4px 6px !important;
+  }
+  .navigation-search {
+    max-width: 100px !important;
+  }
+  .navigation-search input {
+    font-size: 12px !important;
+    padding: 5px 8px !important;
+  }
+
+  /* 主体内容自适应留白 */
+  main {
+    padding: 0 12px !important;
+    padding-bottom: 96px !important;
+  }
+
+  /* 推荐歌单 2 列流式瀑布流 */
+  .index-row {
+    margin-bottom: 20px !important;
+  }
+  .index-row .title {
+    font-size: 18px !important;
+    font-weight: 700 !important;
+    margin: 12px 0 8px !important;
+  }
+  .cover-row,
+  .cover-row[style] {
+    display: grid !important;
+    grid-template-columns: repeat(2, 1fr) !important;
+    gap: 14px 10px !important;
+  }
+  .cover-row .item .text .title {
+    font-size: 13px !important;
+    line-height: 1.4 !important;
+    display: -webkit-box !important;
+    -webkit-line-clamp: 2 !important;
+    -webkit-box-orient: vertical !important;
+    overflow: hidden !important;
+  }
+  .cover-row .item .text .info {
+    font-size: 11px !important;
+    opacity: 0.7;
+  }
+
+  /* 底部播放条升级为 iOS 悬浮胶囊 */
+  .player {
+    padding: 6px 12px calc(6px + env(safe-area-inset-bottom, 0px)) !important;
+    height: auto !important;
+    min-height: 64px !important;
+    border-radius: 18px 18px 0 0 !important;
+  }
+  .player .controls {
+    gap: 8px !important;
+  }
+  .player .volume {
+    display: none !important;
+  }
+  .player .track-info {
+    min-width: 0 !important;
+    flex: 1 !important;
+  }
+  .player .track-info .title {
+    font-size: 13px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+  }
+  .player .track-info .artist {
+    font-size: 11px !important;
+    opacity: 0.8;
+  }
+
+  /* 手机端投屏按钮保持可见 */
+  .r-music-cast-trigger {
+    padding: 6px !important;
+  }
+  .r-music-cast-content {
+    width: 94% !important;
+    padding: 18px !important;
+  }
+}
+
+/* 平板屏幕 (769px ~ 1100px) */
+@media (min-width: 769px) and (max-width: 1100px) {
+  nav {
+    padding: 10px 24px !important;
+  }
+  main {
+    padding: 0 24px 100px !important;
+  }
+  .cover-row[style] {
+    grid-template-columns: repeat(4, 1fr) !important;
+    gap: 18px 14px !important;
+  }
+}

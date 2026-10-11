@@ -1,20 +1,17 @@
 services:
-  r-music:
-    image: sunboss/r-music:latest
-    build: .
-    container_name: r-music
+  web:
+    image: nginx:1.20.2-alpine
+    container_name: music-web
     restart: always
+    volumes:
+      - ./dist:/usr/share/nginx/html:ro
+      - ./custom:/etc/nginx/custom:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     deploy:
       resources:
         limits:
-          cpus: "1.0"
-          memory: 512M
-    environment:
-      - TZ=Asia/Tokyo
-      - AI_GATEWAY=https://api.1234r.com/v1
-    volumes:
-      - /data/sunboss/music/data:/data/music
-      - /data/sunboss/music/custom:/app/custom:ro
+          cpus: "0.5"
+          memory: 256M
     networks:
       - traefik
     labels:
@@ -25,6 +22,43 @@ services:
       - "traefik.http.routers.music.tls=true"
       - "traefik.http.routers.music.tls.certresolver=myresolver"
       - "traefik.http.services.music.loadbalancer.server.port=80"
+    depends_on:
+      - enhancer
+
+  enhancer:
+    image: python:3.11-alpine
+    container_name: music-enhancer
+    restart: always
+    working_dir: /app
+    volumes:
+      - ./ai_service/server.py:/app/server.py:ro
+    command: ["python", "-u", "/app/server.py"]
+    environment:
+      - TZ=Asia/Tokyo
+      - PORT=3001
+      - MUSIC_API_UPSTREAM=http://music-api:3000
+      - AI_GATEWAY=https://api.1234r.com/v1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    networks:
+      - traefik
+    depends_on:
+      - api
+
+  api:
+    image: binaryify/netease_cloud_music_api:latest
+    container_name: music-api
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    networks:
+      - traefik
 
 networks:
   traefik:
