@@ -109,6 +109,9 @@ def _open(url, headers=None, timeout=10, data=None):
 
 def song_detail(sid):
     """返回 (name, artist, album, duration_seconds)"""
+    sid = str(sid or "").strip()     # 防御：调用方可能传整数 id
+    if not sid:
+        return "", "", "", 0
     try:
         with _open(MUSIC_API_UPSTREAM + "/song/detail?ids=" + sid,
                    {"User-Agent": "R-Music-Enhancer"}, 4) as r:
@@ -168,6 +171,9 @@ def is_http(u):
 
 def official_url(sid):
     """取官方直链；试听片段（freeTrialInfo 非空）不算可用，返回 None"""
+    sid = str(sid or "").strip()     # 防御：调用方可能传整数 id
+    if not sid:
+        return None, 0
     try:
         with _open(MUSIC_API_UPSTREAM + "/song/url?id=" + urllib.parse.quote(sid) + "&br=320000",
                    {"User-Agent": "R-Music-Enhancer"}, 10) as r:
