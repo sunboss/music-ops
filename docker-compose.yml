@@ -1,0 +1,31 @@
+services:
+  r-music:
+    image: sunboss/r-music:latest
+    build: .
+    container_name: r-music
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    environment:
+      - TZ=Asia/Tokyo
+      - AI_GATEWAY=https://api.1234r.com/v1
+    volumes:
+      - /data/sunboss/music/data:/data/music
+      - /data/sunboss/music/custom:/app/custom:ro
+    networks:
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik"
+      - "traefik.http.routers.music.entrypoints=websecure"
+      - "traefik.http.routers.music.rule=Host(`music.1234r.com`)"
+      - "traefik.http.routers.music.tls=true"
+      - "traefik.http.routers.music.tls.certresolver=myresolver"
+      - "traefik.http.services.music.loadbalancer.server.port=80"
+
+networks:
+  traefik:
+    external: true
