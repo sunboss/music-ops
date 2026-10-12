@@ -49,6 +49,33 @@ func artistCompatible(want, got string) bool {
 	return false
 }
 
+var nonWord = regexp.MustCompile(`[^\p{Han}\p{Latin}\p{Nd}]+`)
+
+// normLoose 去掉标点、空格、括号等一切非字母/数字/汉字字符，
+// 用于容忍「」「」""（）等纯写法差异
+func normLoose(s string) string {
+	return nonWord.ReplaceAllString(strings.ToLower(s), "")
+}
+
+// matchLoose 放宽版：歌名去掉标点后完全一致 + 歌手兼容；
+// 不判时长（同一录音各平台时长差可能超过容差），由调用方决定是否接受
+func matchLoose(want, got model.Song) string {
+	nw, ng := normLoose(want.Name), normLoose(got.Name)
+	if nw == "" || ng == "" {
+		return "title_missing"
+	}
+	if nw != ng {
+		return "title_or_version"
+	}
+	if norm(want.Artist) == "" {
+		return "artist_missing"
+	}
+	if !artistCompatible(want.Artist, got.Artist) {
+		return "artist"
+	}
+	return ""
+}
+
 func match(want, got model.Song) string {
 	nw, ng := norm(want.Name), norm(got.Name)
 	if nw == "" || ng == "" {

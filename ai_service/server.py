@@ -54,6 +54,8 @@ def _load_ai_key():
 AI_API_KEY = _load_ai_key()
 MUSIC_API_UPSTREAM = os.getenv("MUSIC_API_UPSTREAM", "http://music-api:3000")
 GO_ADAPTER = os.getenv("GO_ADAPTER", "http://go-adapter:8811")
+# 备用地址：主地址（国内隧道）挂掉时自动回落，避免换源整体失效
+GO_ADAPTER_FALLBACK = os.getenv("GO_ADAPTER_FALLBACK", "")
 FALLBACK_SOURCES = os.getenv("FALLBACK_SOURCES", "kuwo,jamendo")
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 CACHE_DB = os.path.join(DATA_DIR, "unblock_cache.db")
@@ -203,13 +205,28 @@ def measure_size(url, sid=None):
     return 0
 
 
+def go_call(path, timeout=60):
+    """调用 Go 适配器。主地址（国内隧道）连不上时自动回退到备用地址（本地容器）。
+    业务失败（HTTP 404/502 等）不换地址——那是「确实没有」，不是网络问题。"""
+    last = None
+    for base in [b for b in (GO_ADAPTER, GO_ADAPTER_FALLBACK) if b]:
+        try:
+            with urllib.request.urlopen(base.rstrip("/") + path, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError:
+            raise
+        except Exception as e:
+            last = e
+            print("[Enhancer] 适配器地址不可用(%s): %s" % (base, str(e)[:60]))
+    raise last if last else RuntimeError("no go adapter configured")
+
+
 def go_resolve(name, artist, album, dur):
     """调用 Go 适配器做严格匹配换源；无匹配返回 None"""
     q = urllib.parse.urlencode({"name": name, "artist": artist, "album": album,
                                 "duration": str(dur or 0), "sources": FALLBACK_SOURCES})
     try:
-        with _open(GO_ADAPTER + "/resolve-best?" + q, {"User-Agent": "R-Music-Enhancer"}, 25) as r:
-            return json.loads(r.read().decode("utf-8"))
+        return go_call("/resolve-best?" + q, timeout=25)
     except urllib.error.HTTPError as e:
         try:
             body = json.loads(e.read().decode("utf-8"))
@@ -405,6 +422,258 @@ def reorder_search_songs(songs):
         return sorted(songs, key=lambda s: 1 if bad_variant((s or {}).get("name")) else 0)
     except Exception:
         return songs
+
+
+# 版本标记：候选歌名里出现「目标没有的」这些词，说明是另一个版本（现场/伴奏/翻唱…），一律不接受
+VERSION_MARKERS = ("live", "现场", "演唱会", "remix", "混音", "伴奏", "instrumental", "翻唱",
+                   "cover", "纯音乐", "钢琴", "吉他", "口琴", "片段", "串烧", "试听", "铃声",
+                   "童声", "女声版", "男声版", "深情版", "加速版", "减速版", "dj版", "教学",
+                   "跟唱", "和声", "清唱", "demo", "重制", "新版", "改编")
+
+AI_PICK_PROMPT = (
+    "判断下面两条音乐元数据是否指**同一首歌的同一个演唱版本**。\n"
+    "只有歌名在标点、繁简、空格、括号等写法上有差异、且歌手一致时才算同一首；\n"
+    "如果是翻唱、现场版、重制版、伴奏、混音等不同版本，或歌手不是同一人，就不算。\n"
+    '只输出 JSON：{"same":true/false,"reason":"简短中文理由"}\n\n'
+    "目标：歌名=%s 歌手=%s 专辑=%s 时长=%s秒\n"
+    "候选：歌名=%s 歌手=%s 专辑=%s 时长=%s秒")
+
+
+def _markers(s):
+    t = (s or "").lower()
+    return {m for m in VERSION_MARKERS if m in t}
+
+
+def _norm_loose(s):
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (s or "").lower())
+
+
+VARIANT_PROMPT = (
+    "你在帮音乐换源做检索。下面这首歌在平台上按原元数据搜不到，请给出**同一首歌**的"
+    "其它检索写法（只输出 JSON，不要解释）：\n"
+    '{"variants":[{"name":"歌名写法","artist":"歌手写法","why":"为什么这么搜"}]}\n'
+    "允许的改写：去掉括号里的补充说明只留主标题、补上/修正歌手名（含常见别名、繁简写法、"
+    "英文名/中文名互换）、去掉多余副标题。\n"
+    "**不允许**换成另一首歌、不允许给出翻唱/现场/伴奏版本。最多 5 条。\n\n"
+    "原元数据：歌名=%s 歌手=%s 专辑=%s 时长=%s秒")
+
+
+def ai_search_variants(name, artist, album, dur):
+    """让模型给出同一首歌的其它检索写法（歌名带括号补充、歌手写法怪时最有用）"""
+    try:
+        out = ai_chat([{"role": "user", "content": VARIANT_PROMPT % (
+            name, artist, album or "", dur or "?")}], temperature=0.3)
+        v = json.loads(_strip_fence(out))
+    except Exception as e:
+        print("[Enhancer] AI 检索变体生成失败: %s" % str(e)[:80])
+        return []
+    out_v = []
+    for it in (v.get("variants") or [])[:5]:
+        if not isinstance(it, dict):
+            continue
+        n = str(it.get("name") or "").strip()
+        a = str(it.get("artist") or artist or "").strip()
+        if n:
+            out_v.append({"name": n, "artist": a, "why": str(it.get("why") or "")[:40]})
+    return out_v
+
+
+def _title_compatible(orig, cand):
+    """候选歌名必须与原歌名互为包含关系（容忍只有括号补充的差异），防止换到另一首歌"""
+    a, b = _norm_loose(orig), _norm_loose(cand)
+    if not a or not b:
+        return False
+    return a in b or b in a
+
+
+def _judge_same(name, artist, album, dur, cname, cartist, calbum, cdur):
+    """让模型对最终候选做一次严格判定：是否为同一首录音"""
+    try:
+        out = ai_chat([{"role": "user", "content": AI_PICK_PROMPT % (
+            name, artist, album or "", dur or "?", cname, cartist, calbum or "", cdur or "?")}],
+            temperature=0)
+        v = json.loads(_strip_fence(out))
+    except Exception as e:
+        print("[Enhancer] AI 选源判定失败: %s" % str(e)[:80])
+        return None
+    return v if v.get("same") else None
+
+
+ARBITER_PROMPT = (
+    "你在给音乐换源做**终审**。规则匹配（歌名严格相等+歌手兼容+时长±8秒）已经失败，"
+    "现在把各平台的原始候选交给你判断。\n"
+    "挑出与目标是**同一首歌、同一个演唱版本**的候选；\n"
+    "· 只有歌名在标点/繁简/空格/括号补充上不同、或歌手名是同一人的不同写法（含英文名、"
+    "组合成员写法、`feat.` 差异）时，才算同一首；\n"
+    "· 翻唱、Live/现场、重制、伴奏、Remix、加速减速、DJ、童声/女声改编版一律**不算**；\n"
+    "· 时长差超过 30 秒基本可判定不是同一录音（除非候选是片段）；\n"
+    "· 都不符合就返回 -1，宁可不要也不能选错。\n"
+    '只输出 JSON：{"index": 编号或-1, "same": true/false, "reason": "简短中文理由"}\n\n'
+    "目标：歌名=%s 歌手=%s 专辑=%s 时长=%s秒\n"
+    "候选：\n%s")
+
+
+def ai_arbitrate(name, artist, album, dur, cands):
+    """把各平台候选交给大模型终审，返回选中的候选（dict）或 None"""
+    if not cands:
+        return None
+    lines = []
+    for i, c in enumerate(cands):
+        lines.append("  [%d] 歌名=%s | 歌手=%s | 专辑=%s | 时长=%s秒 | 平台=%s"
+                     % (i, (c.get("name") or "")[:40], (c.get("artist") or "")[:40],
+                        (c.get("album") or "")[:24], c.get("duration") or "?",
+                        c.get("_source") or "?"))
+    try:
+        out = ai_chat([{"role": "user", "content": ARBITER_PROMPT % (
+            name, artist, album or "", dur or "?", "\n".join(lines))}], temperature=0)
+        v = json.loads(_strip_fence(out))
+    except Exception as e:
+        print("[Enhancer] AI 终审调用失败: %s" % str(e)[:80])
+        return None
+    if not v.get("same"):
+        print("[Enhancer] AI 终审判定不是同一录音: %s" % str(v.get("reason"))[:60])
+        return None
+    try:
+        i = int(v.get("index"))
+    except Exception:
+        return None
+    if i < 0 or i >= len(cands):
+        return None
+    c = dict(cands[i])
+    c["_reason"] = str(v.get("reason") or "")[:60]
+    print("[Enhancer] AI 终审选定 [%d] %s / %s / %s秒 (%s) ← %s"
+          % (i, c.get("name"), c.get("artist"), c.get("duration"),
+             c.get("_source"), c.get("_reason")))
+    return c
+
+
+def gather_candidates(queries, dur):
+    """对每个检索写法，向所有来源要原始候选（不要求匹配），合并去重"""
+    sources = ",".join([s.strip() for s in FALLBACK_SOURCES.split(",") if s.strip()])
+    out, seen = [], set()
+    for q in queries[:4]:
+        try:
+            prm = urllib.parse.urlencode({"name": q["name"], "artist": q["artist"],
+                                          "album": "", "duration": int(dur or 0),
+                                          "sources": sources})
+            r = go_call("/resolve?" + prm, timeout=120)
+        except Exception as e:
+            print("[Enhancer] 取候选失败(%s): %s" % (q.get("name"), str(e)[:60]))
+            continue
+        for o in (r.get("outcomes") or []):
+            for c in (o.get("candidates") or []):
+                if not isinstance(c, dict):
+                    continue
+                k = ((c.get("name") or "").lower(), (c.get("artist") or "").lower())
+                if k in seen:
+                    continue
+                seen.add(k)
+                c = dict(c)
+                c["_source"] = o.get("source")
+                c["_query"] = q.get("name", "") + " " + q.get("artist", "")
+                out.append(c)
+    return out
+
+
+def ai_pick_source(name, artist, album, dur):
+    """规则匹配（歌名相等+歌手兼容+时长±8秒）失败时，让大模型在各平台**原始候选**里终审，
+    找回同一首录音。返回 {"url","source","song","reason"} 或 None。
+    这正是规则的短板：别名/繁简/括号补充/组合成员写法，以及识别翻唱与 Live 版。"""
+    if not ai_enabled() or not name:
+        return None
+    queries = [{"name": name, "artist": artist, "why": "原写法"}]
+    queries += ai_search_variants(name, artist, album, dur)
+
+    cands = gather_candidates(queries, dur)[:24]
+    if not cands:
+        print("[Enhancer] AI 选源：各平台都没有候选 %s / %s" % (name, artist))
+        return None
+    pick = ai_arbitrate(name, artist, album, dur, cands)
+    if not pick:
+        return None
+
+    cn, ca = (pick.get("name") or "").strip(), (pick.get("artist") or "").strip()
+    cd = pick.get("duration") or 0
+    if not cn or not ca:
+        return None
+    # 硬保险：即便模型说「是」，这两条仍然兜住（模型判断失误时不会污染曲库）
+    if dur and cd and abs(cd - dur) > 35:
+        print("[Enhancer] AI 选源被时长保险拦下: 候补 %s 秒 vs 目标 %s 秒" % (cd, dur))
+        return None
+    if _markers(cn) - _markers(name):
+        print("[Enhancer] AI 选源被版本标记保险拦下: %s" % cn)
+        return None
+
+    # 用终审选定的候选名/歌手去取直链（宽松匹配，不受规则时长约束）
+    order = [(pick.get("_source") or "").strip()]
+    order += [s.strip() for s in FALLBACK_SOURCES.split(",") if s.strip()]
+    for src in order:
+        if not src:
+            continue
+        try:
+            prm = urllib.parse.urlencode({"name": cn, "artist": ca, "album": "",
+                                          "duration": int(cd or dur or 0), "source": src,
+                                          "loose": "1"})
+            r = go_call("/resolve-url?" + prm, timeout=90)
+        except Exception:
+            continue
+        u = r.get("url")
+        if is_http(u):
+            s = r.get("song") or {}
+            print("[Enhancer] AI 选源拿到直链 %s / %s ← 平台 %s（%s）"
+                  % (s.get("name"), s.get("artist"), src, pick.get("_reason")))
+            return {"url": u, "source": src, "song": s,
+                    "reason": pick.get("_reason") or "", "query": cn + " " + ca}
+    print("[Enhancer] AI 选源选定候选但取链失败: %s / %s" % (cn, ca))
+    return None
+
+
+CURATE_PROMPT = (
+    "你是音乐电台主编。下面是为用户需求检索到的**真实可播放**歌曲列表（已确认能完整播放）。\n"
+    "请做三件事：①只保留真正贴合需求的歌，并按播放顺序排好（明显不搭、重复、风格跳脱的剔除）；"
+    "②给这张歌单起个名字；③用一句话说明编排思路。\n"
+    "注意：宁少勿滥，但至少保留 5 首。\n"
+    '只输出 JSON：{"title":"歌单名(12字内)","reply":"一句话说明","pick":[编号,编号,...],'
+    '"drop":"剔除原因(没有就留空)"}\n'
+    "pick 里只放编号，按你希望的播放顺序排列。\n\n"
+    "用户需求：%s\n候选歌曲：\n%s")
+
+
+def ai_curate(text, songs):
+    """让大模型对真实可播歌单做取舍与排序（规则做不到的「像不像这个场景」判断）。
+    返回 {"title","reply","songs"} 或 None（失败时保留原样）"""
+    if not ai_enabled() or len(songs) < 5:
+        return None
+    lines = []
+    for i, s in enumerate(songs):
+        lines.append("  [%d] %s / %s / %s秒" % (i, (s.get("name") or "")[:40],
+                                                (s.get("artist") or "")[:32],
+                                                int(s.get("duration") or 0)))
+    try:
+        out = ai_chat([{"role": "user", "content": CURATE_PROMPT % (text, "\n".join(lines))}],
+                      temperature=0.4)
+        v = json.loads(_strip_fence(out))
+    except Exception as e:
+        print("[Enhancer] AI 策展失败(保留原歌单): %s" % str(e)[:80])
+        return None
+    pick, seen = [], set()
+    for x in (v.get("pick") or []):
+        try:
+            i = int(x)
+        except Exception:
+            continue
+        if 0 <= i < len(songs) and i not in seen:
+            seen.add(i)
+            pick.append(i)
+    if len(pick) < 5:
+        print("[Enhancer] AI 策展结果太少(%d 首)，保留原歌单" % len(pick))
+        return None
+    ordered = [songs[i] for i in pick]
+    rest = [s for i, s in enumerate(songs) if i not in seen]
+    print("[Enhancer] AI 策展: 保留 %d 首 / 候选 %d 首，剔除 %d 首 %s"
+          % (len(pick), len(songs), len(rest), ("（%s）" % v.get("drop")) if v.get("drop") else ""))
+    return {"title": str(v.get("title") or "")[:20], "reply": str(v.get("reply") or "")[:80],
+            "songs": ordered + rest, "picked": len(pick)}
 
 
 def rank_songs(songs, plan):
@@ -914,12 +1183,21 @@ class H(BaseHTTPRequestHandler):
                 songs += [s for s in extra if s["id"] not in have]
             except Exception as e:
                 print("[Enhancer] AI 电台补词失败: %s" % e)
-        print("[Enhancer] AI 电台 %r -> %d 首可播（关键词 %d 个）"
-              % (text[:24], len(songs), len(plan["keywords"])))
-        return self._json(200, {"title": plan.get("title") or "AI 电台",
-                                "reply": plan.get("reply") or "",
+        title = plan.get("title") or "AI 电台"
+        reply = plan.get("reply") or ""
+        # 让大模型对真实可播歌单做策展（取舍 + 排序 + 命名）
+        cur = ai_curate(text, songs)
+        if cur:
+            title = cur["title"] or title
+            reply = cur["reply"] or reply
+            songs = cur["songs"]
+        songs = songs[:want]
+        print("[Enhancer] AI 电台 %r -> %d 首可播（关键词 %d 个，策展=%s）"
+              % (text[:24], len(songs), len(plan["keywords"]), bool(cur)))
+        return self._json(200, {"title": title, "reply": reply,
+                                "curated": bool(cur), "picked": (cur or {}).get("picked"),
                                 "plan": {"keywords": plan["keywords"]},
-                                "songs": songs[:want], "playable_count": len(songs[:want])})
+                                "songs": songs, "playable_count": len(songs)})
 
     # ------------------------------------------------------------ AI 点歌
     def handle_ai_query(self, query, body=None):
@@ -1094,7 +1372,7 @@ class H(BaseHTTPRequestHandler):
             return
         name, artist, album, dur = song_detail(sid)
 
-        cands, seen = [], set()
+        cands, seen, ai_done = [], set(), False
         if hit and hit[0] and hit[0] != REJECT_MARK:
             cands.append((hit[0], hit[3] or "cache"))
             seen.add(hit[0])
@@ -1111,6 +1389,15 @@ class H(BaseHTTPRequestHandler):
             elif not res or not is_http(fb):
                 print("[Enhancer] 换源无匹配 %s / %s: %s"
                       % (name, artist, (res or {}).get("attempts")))
+                # 规则匹配不到：让模型在「同曲不同写法」的候选里判断（只接受同一录音）
+                ai_done = True
+                picked = ai_pick_source(name, artist, album, dur)
+                if picked:
+                    cands.append((picked["url"], "ai-pick"))
+                    seen.add(picked["url"])
+                    print("[Enhancer] AI 选源候选 %s / %s ← 平台 %s（%s，%s秒）"
+                          % (name, artist, picked["source"],
+                             picked["reason"], (picked.get("song") or {}).get("duration")))
         outer = NETEASE_OUTER + urllib.parse.quote(sid)
         if outer not in seen:
             cands.append((outer, "netease-outer"))
@@ -1131,6 +1418,18 @@ class H(BaseHTTPRequestHandler):
                 continue
             print("[Enhancer] %s 来源落盘失败(%s) %s" % (src, why, sid))
             up_url = up_url or cand
+
+        # 规则路径全军覆没（含候选都被判为片段）：给 AI 选源最后一次机会
+        if not ai_done and name and rejected:
+            picked = ai_pick_source(name, artist, album, dur)
+            if picked:
+                lp, why = fetch_to_disk(sid, picked["url"], dur)
+                if lp:
+                    build_entry(sid, picked["url"], dur, "ai-pick")
+                    print("[Enhancer] 采用 AI 选源(s)完成落盘 %s (%s) ← %s: %s"
+                          % (sid, name, picked["source"], picked["reason"]))
+                    return self.serve_audio_file(lp)
+                print("[Enhancer] AI 选源落盘失败(%s) %s" % (why, sid))
 
         if rejected and rejected >= len(cands):
             # 所有来源拿到的都是试听片段：标记不可播放，避免反复重试

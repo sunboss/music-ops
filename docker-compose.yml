@@ -43,6 +43,9 @@ services:
       - FALLBACK_SOURCES=kuwo,jamendo
       - DATA_DIR=/data
       # AI 点歌：大模型网关（密钥从挂载文件 /data/ai_key.txt 读取，不进代码/日志/仓库）
+      # Go 换源适配器：主用国内机（原生国内出口，经东京端口转发），挂掉自动回退本地容器
+      - GO_ADAPTER=http://172.19.0.1:18811
+      - GO_ADAPTER_FALLBACK=http://go-adapter:8811
       - AI_GATEWAY=https://api.1234r.com/v1
       - AI_MODEL=gemini-3.1-flash-lite
       - AI_API_KEY_FILE=/data/ai_key.txt

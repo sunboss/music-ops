@@ -7,32 +7,43 @@
                             ├── /            静态前端 YesPlayMusic + sub_filter 注入定制主题/脚本
                             └── /api/*       ──► music-enhancer (Python, :3001)
                                                   ├── 官方可用 ──► music-api (netease_cloud_music_api, :3000)
-                                                  └── 官方不可用 ──► music-go-adapter (Go, :8811)
-                                                                        └── go-music-dl 严格匹配换源
-                                                                              └── 取直链（经国内出口）
+                                                  └── 官方不可用 ──► Go 换源适配器（跑在国内机）
+                                                                        └── 严格匹配 → 大模型终审
+                                                                              └── 取直链（原生国内出口）
 ```
 
 - 线上目录：`/data/sunboss/music`（服务器 `64.83.34.204`）
 - 容器：`music-web` / `music-enhancer` / `music-go-adapter` / `music-api`
 - 换源适配器与网易云 API **都不对外发布端口**，只走内部网络
 
-## ⚠️ 关键依赖：国内取链中转
+## ⚠️ 关键依赖：国内取链
 
-`music-cn-relay.service`（东京服务器上的 systemd 服务）
+**适配器跑在国内机**（`111.228.4.117`，systemd `r-music-adapter.service`，监听 `127.0.0.1:8811`），
+东京只做端口转发把它接到 Docker 网段：
 
 ```
-ssh -N -D 172.19.0.1:11080 root@111.228.4.117      # SOCKS5 动态转发
+music-cn-adapter-tunnel.service   # 东京：ssh -N -L 172.19.0.1:18811:127.0.0.1:8811 root@111.228.4.117
 ```
 
-**为什么必须有**：国内音乐平台（酷我等）的签名直链接口**只对国内 IP 返回真实地址**，
-从东京直接请求会返回字符串 `"None"`。经这条隧道发出请求即可拿到真实直链。
-**音频文件本身东京可以直连**，所以只有「取直链」这一步需要走隧道——代理只配在
-`go-adapter` 容器上（`HTTP_PROXY` / `HTTPS_PROXY`），`enhancer` 不配代理。
+`enhancer` 用 `GO_ADAPTER=http://172.19.0.1:18811`（主）+
+`GO_ADAPTER_FALLBACK=http://go-adapter:8811`（东京本地容器，备用）。
+
+**为什么要放国内**：国内平台的签名直链接口**只对国内 IP 返回真实地址**（东京直连返回 `"None"`）。
+早期做法是东京容器经 SOCKS5 代理逐请求出国，链路慢且咪咕一类接口会超时；
+把适配器整体放到国内机后是**原生国内出口**，实测取链 0.4 秒，且不再依赖逐请求代理。
+**音频字节仍由东京直连下载**（国内机到东京带宽只有 ~19KB/s，绝不能让它中转音频）。
+
+主地址不通时 `go_call()` 会自动回退到备用地址；两个都不通则如实报「无可用音源」，不伪造。
 
 服务一旦挂掉，表现为：所有需要换源的歌都变成「无可用音源」。
 
 ```bash
-systemctl status music-cn-relay        # 状态
+# 国内机（换源适配器本体）
+ssh root@64.83.34.204 'ssh root@111.228.4.117 "systemctl status r-music-adapter"'
+# 东京（端口转发）
+systemctl status music-cn-adapter-tunnel
+journalctl -u music-cn-adapter-tunnel -n 30
+systemctl status music-cn-relay        # 旧的 SOCKS 中转（备用，可保留）
 systemctl restart music-cn-relay       # 重启
 ss -lnt | grep 11080                   # 端口监听（绑定 172.19.0.1，仅 Docker 网段可达）
 journalctl -u music-cn-relay -n 30     # 日志

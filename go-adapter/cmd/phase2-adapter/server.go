@@ -131,6 +131,7 @@ func handleResolve(w http.ResponseWriter, r *http.Request) {
 
 func handleResolveURL(w http.ResponseWriter, r *http.Request) {
 	want := parseWant(r)
+	loose := r.URL.Query().Get("loose") == "1"
 	src := strings.TrimSpace(r.URL.Query().Get("source"))
 	if want.Name == "" || src == "" {
 		writeJSON(w, 400, map[string]string{"error": "name and source are required"})
@@ -153,13 +154,14 @@ func handleResolveURL(w http.ResponseWriter, r *http.Request) {
 		if g.IsInvalid || g.IsVIP {
 			continue
 		}
-		if match(want, g) == "" {
+		if (loose && matchLoose(want, g) == "") || (!loose && match(want, g) == "") {
 			picked = &g
 			break
 		}
 	}
 	if picked == nil {
-		writeJSON(w, 404, map[string]string{"error": "no strict match", "searched": kwOf(want)})
+		writeJSON(w, 404, map[string]string{"error": "no strict match", "searched": kwOf(want),
+			"loose": strconv.FormatBool(loose)})
 		return
 	}
 	url, err := dl(picked)
@@ -174,7 +176,7 @@ func handleResolveURL(w http.ResponseWriter, r *http.Request) {
 	}
 	// 只回传上游真实返回的字段；不推断、不编造 size/bitrate
 	writeJSON(w, 200, map[string]any{
-		"song": picked, "url": url,
+		"song": picked, "url": url, "loose": loose,
 		"size_reported": picked.Size, "bitrate_reported": picked.Bitrate,
 		"note": "size/bitrate 为上游上报值，未经验证；请以实际下载与解码结果为准",
 	})
