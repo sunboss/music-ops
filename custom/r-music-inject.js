@@ -3,7 +3,7 @@
  * 仅保留：顶部导航栏品牌 Logo；并清除旧版 Service Worker 缓存，保证增强脚本生效
  */
 (function () {
-  window.__RM_VERSION = "20261012m";
+  window.__RM_VERSION = "20261012n";
 
   (async function killOldServiceWorker() {
     try {
@@ -80,4 +80,42 @@
       })
       .catch(function () {});
   } catch (e) {}
+})();
+
+/* 客户端回报：让服务端能看到「这台设备到底在播什么」——排查用户端异常时最关键的信息 */
+(function () {
+  function report(obj) {
+    try {
+      obj.v = window.__RM_VERSION;
+      obj.ua = navigator.userAgent;
+      var body = JSON.stringify(obj);
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon("/api/client-report", new Blob([body], {type: "application/json"}));
+      } else {
+        fetch("/api/client-report", {method: "POST", body: body, keepalive: true}).catch(function () {});
+      }
+    } catch (e) {}
+  }
+  // 页面状态（含当前注册的 Service Worker，便于判断是否是旧版缓存）
+  setTimeout(function () {
+    var info = {kind: "page", url: location.href, sw: ""};
+    if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+      navigator.serviceWorker.getRegistrations().then(function (rs) {
+        info.sw = rs.map(function (r) { return (r.active && r.active.scriptURL) || "?"; }).join("|");
+        report(info);
+      }).catch(function () { report(info); });
+    } else { report(info); }
+  }, 2500);
+
+  // 每次开始播放，回报实际地址与浏览器识别到的时长
+  document.addEventListener("play", function (e) {
+    var a = e.target;
+    if (!a || a.tagName !== "AUDIO") return;
+    var send = function () {
+      report({kind: "play", src: a.currentSrc || a.src || "", dur: a.duration || 0,
+              t: a.currentTime || 0});
+    };
+    if (a.duration) { send(); }
+    else { a.addEventListener("loadedmetadata", send, {once: true}); }
+  }, true);
 })();

@@ -235,6 +235,14 @@ def probe_duration(path):
     try:
         with open(path, "rb") as f:
             head = f.read(16)
+            if head[:4] == b"fLaC":
+                # FLAC: STREAMINFO 里有采样率与总采样数
+                f.seek(0)
+                d = f.read(64)
+                b = int.from_bytes(d[18:26], "big")
+                sr = b >> 44
+                total = b & ((1 << 36) - 1)
+                return (total / float(sr)) if sr and total else 0.0
             if head[4:8] == b"ftyp":
                 f.seek(0)
                 data = f.read(4 * 1024 * 1024)
@@ -282,12 +290,40 @@ def probe_duration(path):
     return total
 
 
+# 低于这个码率（字节/秒）在音乐里不现实，用于在解析不出时长时兜底判断
+MIN_BYTES_PER_SEC = 6000.0          # 约 48 kbps
+
+
 def duration_ok(path, expected):
-    """文件真实时长必须与歌曲时长吻合；差太多说明拿到的是试听片段或占位音频"""
+    """文件必须是完整音频。两道判断：
+    1) 能解析出真实时长 -> 必须与歌曲时长吻合
+    2) 解析不出（少见格式）-> 用体积下限兜底，挡住 30 秒片段冒充长曲
+    """
     actual = probe_duration(path)
-    if not expected or actual <= 0:
+    if not expected:
         return True, actual
-    return actual >= expected - 8, actual
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        size = 0
+    if actual > 0:
+        # 交叉校验：出现下列任一情况，说明时长解析不可信（多半是少见容器格式），
+        # 改用体积兜底 —— 避免误伤正常音频，同时仍能挡住试听片段
+        #   ① 时长与体积矛盾（暗含码率低于 2.4kbps）
+        #   ② 解析出的时长极短但文件很大（真片段不会又长又大）
+        unreliable = bool(size) and ((size / actual < 300) or (actual < 5 and size > 1000000))
+        if unreliable:
+            print("[Enhancer] 时长(%0.1fs)与体积(%d 字节)不匹配，解析不可信，改用体积兜底"
+                  % (actual, size))
+            actual = 0.0
+        else:
+            return actual >= expected - 8, actual
+    if not size:
+        return True, actual
+    if expected > 20 and size < expected * MIN_BYTES_PER_SEC:
+        print("[Enhancer] 时长无法解析且体积过小(%d 字节 / 期望 %d 秒)，判为片段" % (size, expected))
+        return False, actual
+    return True, actual
 
 
 # ------------------------------------------------- 整曲落盘（解决播放中途直链过期）
@@ -793,7 +829,30 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         p = urllib.parse.urlparse(self.path)
         real = p.path[4:] if p.path.startswith("/api/") else p.path
+        if real == "/client-report":
+            return self.handle_client_report()
         return self.proxy_upstream(real, p.query)
+
+    def handle_client_report(self):
+        """接收前端回报：客户端当前状态与实际播放的音频（用于排查“用户端到底播了什么”）"""
+        try:
+            ln = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(ln) if ln else b"{}"
+            d = json.loads(raw.decode("utf-8", "ignore"))
+        except Exception as e:
+            print("[Enhancer] 客户端回报解析失败: %s" % e)
+            return self._json(200, {"ok": False})
+        kind = d.get("kind") or "?"
+        if kind == "page":
+            print("[Enhancer] 客户端页面 v=%s sw=%s url=%s ua=%s" % (
+                d.get("v"), d.get("sw"), (d.get("url") or "")[:80], (d.get("ua") or "")[:60]))
+        elif kind == "play":
+            print("[Enhancer] 客户端播放 src=%s 时长=%s 秒 位置=%s v=%s ua=%s" % (
+                (d.get("src") or "")[:110], d.get("dur"), d.get("t"), d.get("v"),
+                (d.get("ua") or "")[:50]))
+        else:
+            print("[Enhancer] 客户端回报: %s" % json.dumps(d, ensure_ascii=False)[:300])
+        return self._json(200, {"ok": True, "build": BUILD})
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
