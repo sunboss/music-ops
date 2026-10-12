@@ -2,17 +2,15 @@
 import { computed } from "vue";
 import { Pause, Play, SkipForward } from "lucide-vue-next";
 import { usePlayerStore } from "@/stores/player";
-import { useRouter } from "vue-router";
 import Cover from "./Cover.vue";
 
 const p = usePlayerStore();
-const router = useRouter();
 const pct = computed(() => (p.duration ? Math.min(100, (p.progress / p.duration) * 100) : 0));
 const artist = computed(() => (p.current?.ar || []).map((a) => a.name).join(", "));
 </script>
 
 <template>
-  <div v-if="p.current" class="mini vibrant" @click="router.push('/ai')">
+  <div v-if="p.current" class="mini vibrant" @click="p.showFull = true">
     <div class="line"><i :style="{ width: pct + '%' }" /></div>
     <Cover :src="p.current.al?.picUrl" radius="5px" class="cv" />
     <div class="mm">

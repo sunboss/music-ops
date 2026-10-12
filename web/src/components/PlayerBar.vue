@@ -21,9 +21,9 @@ function seek(e: MouseEvent) {
   <div class="bar vibrant">
     <!-- Apple Music 标志性的顶部细进度线 -->
     <div class="track" @click="seek"><i :style="{ width: pct + '%' }" /></div>
-    <Cover v-if="p.current" :src="p.current.al?.picUrl" radius="6px" class="pc" />
+    <Cover v-if="p.current" :src="p.current.al?.picUrl" radius="6px" class="pc" @click="p.showFull = true" />
     <div v-else class="pc empty" />
-    <div class="meta">
+    <div class="meta" @click="p.current && (p.showFull = true)">
       <div class="nm ellipsis">{{ p.current?.name || "未在播放" }}</div>
       <div class="ar ellipsis">{{ artist || "选一首歌开始" }}</div>
     </div>
@@ -45,7 +45,8 @@ function seek(e: MouseEvent) {
 .track { position: absolute; left: 0; right: 0; top: -1px; height: 3px; cursor: pointer; }
 .track i { display: block; height: 100%; background: var(--fg); opacity: .5; transition: width .25s linear; }
 .track:hover { height: 5px; }
-.pc { width: 44px; flex: none; box-shadow: var(--shadow); }
+.pc { width: 44px; flex: none; box-shadow: var(--shadow); cursor: pointer; }
+.meta { cursor: pointer; }
 .pc.empty { background: var(--fill); aspect-ratio: 1; }
 .pc :deep(img) { border-radius: 6px; }
 .meta { min-width: 120px; max-width: 240px; }

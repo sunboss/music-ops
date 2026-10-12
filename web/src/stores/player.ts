@@ -1,12 +1,18 @@
 import { defineStore } from "pinia";
-import { Howl } from "howler";
 import { api } from "@/api/client";
 import type { Song } from "@/api/types";
+import { parseLrc, type LyricLine } from "@/utils/lrc";
 
-/** 播放器全局单例：路由切换绝不重建，保证不打断播放 */
-let howl: Howl | null = null;
-let playStart = 0;          // 本首开始播放的时间戳
-let reported = false;       // 本首是否已上报过
+/**
+ * 播放器内核：全局单例的原生 <audio>，路由切换绝不重建。
+ * 说明：之前用 Howler，但它无法从 /api/audio/proxy?id=X 这种没有扩展名的地址推断格式
+ * （"No file extension was found"），会直接加载失败；原生元素只看 Content-Type，更稳，
+ * 也省掉 36KB 依赖。
+ */
+const el: HTMLAudioElement = new Audio();
+el.preload = "metadata";
+let playStart = 0;
+let reported = false;
 
 export const usePlayerStore = defineStore("player", {
   state: () => ({
@@ -14,134 +20,167 @@ export const usePlayerStore = defineStore("player", {
     index: -1,
     playing: false,
     loading: false,
-    progress: 0,            // 秒
-    duration: 0,            // 秒
-    volume: 1,
-    muted: false,
+    progress: 0,
+    duration: 0,
+    volume: Number(localStorage.getItem("volume") ?? 1),
     error: "",
+    showFull: false,
+    lyrics: [] as LyricLine[],
+    lyricFor: -1,
+    ready: false,
   }),
   getters: {
     current(state): Song | null { return state.queue[state.index] ?? null; },
     hasQueue(state) { return state.queue.length > 0; },
   },
   actions: {
-    /** 播放一批歌（歌单/专辑/搜索结果是数组） */
+    /** 绑定一次性事件（单例，只绑一次） */
+    init() {
+      if (this.ready) return;
+      this.ready = true;
+      el.volume = this.volume;
+
+      el.addEventListener("loadedmetadata", () => {
+        this.loading = false;
+        if (isFinite(el.duration) && el.duration > 0) this.duration = Math.round(el.duration);
+      });
+      el.addEventListener("timeupdate", () => {
+        this.progress = el.currentTime || 0;
+        // 听满 30 秒立即记账：不能只在切歌时上报，否则一直听下去永远不落库
+        if (!reported && playStart && Date.now() - playStart >= 30000 && this.current) {
+          reported = true;
+          void api.reportTaste(this.current.id, "play", Math.round(this.progress), this.duration);
+        }
+      });
+      el.addEventListener("play", () => { this.playing = true; playStart = playStart || Date.now(); });
+      el.addEventListener("pause", () => { this.playing = false; });
+      el.addEventListener("ended", () => {
+        if (!reported && this.current) {
+          reported = true;
+          void api.reportTaste(this.current.id, "play", Math.round(el.duration || 0), this.duration);
+        }
+        this.next(true);
+      });
+      el.addEventListener("error", () => {
+        this.loading = false;
+        this.error = "这首歌加载失败";
+        const deadIndex = this.index;
+        if (deadIndex >= 0 && this.queue[deadIndex]) this.queue[deadIndex].playable = false;
+      });
+      this.setupMediaSession();
+    },
+
+    /** 锁屏/通知栏控制（手机上是刚需） */
+    setupMediaSession() {
+      if (!("mediaSession" in navigator)) return;
+      const ms = navigator.mediaSession;
+      ms.setActionHandler("play", () => this.toggle());
+      ms.setActionHandler("pause", () => this.toggle());
+      ms.setActionHandler("previoustrack", () => this.prev());
+      ms.setActionHandler("nexttrack", () => this.next());
+    },
+
+    syncMediaSession() {
+      if (!("mediaSession" in navigator) || !this.current) return;
+      const s = this.current;
+      try {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: s.name,
+          artist: (s.ar || []).map((a) => a.name).join(", "),
+          album: s.al?.name || "",
+          artwork: s.al?.picUrl ? [{ src: s.al.picUrl, sizes: "500x500", type: "image/jpeg" }] : [],
+        });
+      } catch { /* 部分浏览器不支持完整 metadata，忽略 */ }
+    },
+
     playQueue(songs: Song[], index = 0) {
       if (!songs.length) return;
       this.queue = songs.slice();
-      this.playAt(index);
+      void this.playAt(index);
     },
 
     async playAt(i: number) {
+      this.init();
       const song = this.queue[i];
       if (!song) return;
+      // 上一首没听够就算「跳过」（服务端据此不再推荐）
+      if (playStart && !reported && Date.now() - playStart < 20000) {
+        const prev = this.queue[this.index];
+        const played = Math.round((Date.now() - playStart) / 1000);
+        if (prev && prev.id !== song.id) void api.reportTaste(prev.id, "skip", played, Math.round(this.duration || 0));
+      }
       this.index = i;
       this.loading = true;
       this.error = "";
       this.progress = 0;
       reported = false;
-
-      // 上一首没听够就算「跳过」（服务端据此不再推荐）
-      if (howl && playStart && !reported && Date.now() - playStart < 20000) {
-        const prev = this.queue[this.index - 1];
-        const played = Math.round((Date.now() - playStart) / 1000);
-        if (prev) void api.reportTaste(prev.id, "skip", played, Math.round(this.duration || 0));
-      }
-      this.unload();
+      this.syncMediaSession();
+      void this.loadLyrics();
 
       try {
         const item = await api.songUrl(song.id);
         if (!item?.url || item.source === "no-source") {
-          // 没有完整音源：标记置灰并自动跳到下一首（绝不静默播 30 秒试听）
           song.playable = false;
-          const failed = i;
           this.loading = false;
-          if (failed + 1 < this.queue.length) this.playAt(failed + 1);
+          if (i + 1 < this.queue.length) { void this.playAt(i + 1); }
           else this.error = "后面没有可播放的歌了";
           return;
         }
         song.playable = true;
         this.duration = Math.round((song.dt || 0) / 1000);
-        const h = new Howl({
-          src: [item.url],
-          html5: true,
-          volume: this.muted ? 0 : this.volume,
-          onload: () => {
-            this.loading = false;
-            const d = h.duration();
-            if (d && isFinite(d)) this.duration = Math.round(d);
-          },
-          onplay: () => {
-            this.playing = true;
-            playStart = playStart || Date.now();
-          },
-          onend: () => {
-            if (!reported && this.current) {
-              reported = true;
-              void api.reportTaste(this.current.id, "play", Math.round(h.duration()), Math.round(h.duration()));
-            }
-            this.next(true);
-          },
-          onloaderror: () => { this.loading = false; this.error = "这首歌加载失败"; },
-        });
-        howl = h;
+        el.src = item.url;
         playStart = Date.now();
-        h.play();
-        this.startTicker();
+        await el.play().catch(() => { this.loading = false; });
+        this.loading = false;
       } catch {
         this.loading = false;
         this.error = "取源失败";
       }
     },
 
-    unload() {
-      if (howl) { try { howl.unload(); } catch { /* noop */ } howl = null; }
-      this.playing = false;
-    },
-
     toggle() {
-      if (!howl) { if (this.queue.length) this.playAt(Math.max(0, this.index)); return; }
-      if (howl.playing()) howl.pause(); else howl.play();
-      this.playing = !this.playing;
+      this.init();
+      if (!el.src) { if (this.queue.length) void this.playAt(Math.max(0, this.index)); return; }
+      if (el.paused) { playStart = playStart || Date.now(); void el.play().catch(() => {}); }
+      else el.pause();
     },
 
     next(fromEnd = false) {
-      if (this.index + 1 < this.queue.length) this.playAt(this.index + 1);
-      else { this.unload(); this.progress = 0; if (!fromEnd) this.playAt(0); }
+      if (this.index + 1 < this.queue.length) { void this.playAt(this.index + 1); return; }
+      el.pause(); this.progress = 0;
+      if (!fromEnd && this.queue.length) void this.playAt(0);
+      else this.playing = false;
     },
 
     prev() {
-      if (this.progress > 4 && howl) { howl.seek(0); return; }   // 播过 4 秒则回到本首开头
-      if (this.index > 0) this.playAt(this.index - 1);
+      if (this.progress > 4) { el.currentTime = 0; return; }   // 播过 4 秒则回到本首开头
+      if (this.index > 0) void this.playAt(this.index - 1);
     },
 
     seekRatio(r: number) {
-      if (!howl || !this.duration) return;
+      if (!this.duration) return;
       const t = Math.max(0, Math.min(1, r)) * this.duration;
-      howl.seek(t);
+      try { el.currentTime = t; } catch { /* 元数据未就绪时忽略 */ }
       this.progress = t;
     },
 
     setVolume(v: number) {
       this.volume = v;
-      this.muted = v === 0;
-      howl?.volume(v);
+      el.volume = v;
+      localStorage.setItem("volume", String(v));
     },
 
-    startTicker() {
-      if ((this as unknown as { _t?: number })._t) return;
-      const t = window.setInterval(() => {
-        if (howl && howl.playing()) {
-          const p = howl.seek() as number;
-          this.progress = typeof p === "number" ? p : 0;
-          // 听满 30 秒立即记账：不能只在切歌时才上报，否则一直听下去永远不落库
-          if (!reported && playStart && Date.now() - playStart >= 30000 && this.current) {
-            reported = true;
-            void api.reportTaste(this.current.id, "play", Math.round(this.progress), this.duration);
-          }
-        }
-      }, 1000);
-      (this as unknown as { _t?: number })._t = t;
+    async loadLyrics() {
+      const s = this.current;
+      if (!s) { this.lyrics = []; this.lyricFor = -1; return; }
+      if (this.lyricFor === s.id) return;
+      this.lyricFor = s.id;
+      this.lyrics = [];
+      try {
+        const r = await api.lyric(s.id);
+        if (this.lyricFor !== s.id) return;
+        this.lyrics = parseLrc(r.lyric, r.tlyric);
+      } catch { /* 拿不到歌词就留空，不打扰播放 */ }
     },
   },
 });

@@ -3,6 +3,7 @@ import { computed, ref } from "vue";
 import { RouterView, useRouter, useRoute } from "vue-router";
 import { Search, Sparkles, House, Compass, Library, ChevronLeft } from "lucide-vue-next";
 import PlayerBar from "@/components/PlayerBar.vue";
+import FullPlayer from "@/components/FullPlayer.vue";
 import MiniPlayer from "@/components/MiniPlayer.vue";
 import TabBar from "@/components/TabBar.vue";
 import { usePlayerStore } from "@/stores/player";
@@ -78,6 +79,8 @@ function doSearch() {
 
       <!-- 桌面播放条 -->
       <PlayerBar class="d-bar" />
+      <!-- 全屏播放器（桌面抽屉式 / 移动全屏，含歌词） -->
+      <FullPlayer />
       <!-- 移动端：迷你播放条 + 底部 Tab -->
       <div class="m-bottom vibrant">
         <MiniPlayer />
