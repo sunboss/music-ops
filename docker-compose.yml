@@ -40,7 +40,10 @@ services:
       - PORT=3001
       - MUSIC_API_UPSTREAM=http://music-api:3000
       - GO_ADAPTER=http://go-adapter:8811
-      - FALLBACK_SOURCES=kuwo,jamendo
+      # 音源平台优先级（实测排序：kuwo 最稳；migu 每次 30s 超时已摘除）
+      - FALLBACK_SOURCES=kuwo,kugou,qq,netease,qianqian,bilibili,joox,soda,fivesing,jamendo
+      # 网易云直链默认不参与取音源（ADR-1）；需要时置 1 开回最后手段
+      - ALLOW_OFFICIAL=0
       - DATA_DIR=/data
       # AI 点歌：大模型网关（密钥从挂载文件 /data/ai_key.txt 读取，不进代码/日志/仓库）
       # Go 换源适配器：主用国内机（原生国内出口，经东京端口转发），挂掉自动回退本地容器

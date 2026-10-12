@@ -61,7 +61,17 @@ MUSIC_API_UPSTREAM = os.getenv("MUSIC_API_UPSTREAM", "http://music-api:3000")
 GO_ADAPTER = os.getenv("GO_ADAPTER", "http://go-adapter:8811")
 # 备用地址：主地址（国内隧道）挂掉时自动回落，避免换源整体失效
 GO_ADAPTER_FALLBACK = os.getenv("GO_ADAPTER_FALLBACK", "")
-FALLBACK_SOURCES = os.getenv("FALLBACK_SOURCES", "kuwo,jamendo")
+# 音源平台优先级 —— 依据实测（CN 原生 IP，5 首样本 × 11 平台）：
+#   kuwo 取到 4/5 真直链（0.1-0.2s）；kugou 5/5 匹配但仅 1/5 出链；qq/netease(库内) 各 1/5；
+#   joox/jamendo/bilibili/千千/汽水/5sing 对这 5 首 0-1 匹配（留着不亏，失败都很快）；
+#   **migu 每次 30 秒超时**（pd.musicapp.migu.cn 不可达）→ 从列表里摘掉，否则每次失败白等 30 秒。
+# 平台能不能用要用真实歌曲实测，不看文档承诺。
+DEFAULT_SOURCES = "kuwo,kugou,qq,netease,qianqian,bilibili,joox,soda,fivesing,jamendo"
+FALLBACK_SOURCES = os.getenv("FALLBACK_SOURCES", DEFAULT_SOURCES)
+
+# 网易云直链（NetEase 系统）默认不参与取音源（ADR-1：音源以自有 Go 引擎为主力）。
+# 需要临时开回最后手段时置 ALLOW_OFFICIAL=1，不必改代码。
+ALLOW_OFFICIAL = os.getenv("ALLOW_OFFICIAL", "0") == "1"
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 CACHE_DB = os.path.join(DATA_DIR, "unblock_cache.db")
 CACHE_TTL = 1800          # 上游直链带签名会过期，30 分钟后重新解析
@@ -235,7 +245,7 @@ def measure_size(url, sid=None):
         if lp:
             return os.path.getsize(lp)
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-0"})
+        req = urllib.request.Request(url, headers=dict(stream_headers(url), Range="bytes=0-0"))
         with urllib.request.urlopen(req, timeout=8) as r:
             cr = r.headers.get("Content-Range") or ""
             r.read(1)
@@ -710,8 +720,9 @@ def sniff_audio_type(head):
 def probe_audio_headers(url):
     """HEAD 用：只发一个 16 字节的 Range 请求，拿真实类型与总长度，不拉整曲"""
     try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": UA_BROWSER, "Accept": "*/*", "Range": "bytes=0-15"})
+        h = stream_headers(url)
+        h["Range"] = "bytes=0-15"
+        req = urllib.request.Request(url, headers=h)
         with urllib.request.urlopen(req, timeout=15) as r:
             head = r.read(16) or b""
             cr = r.headers.get("Content-Range") or ""
@@ -1568,12 +1579,40 @@ def evict_audio(force=False):
     return removed > 0
 
 
+# 国内平台直链普遍校验 Referer：实测酷我系直链缺 Referer 会 403 Forbidden。
+# 按 URL 主机补上对应站点的 Referer，取流（落盘/Range 探测/流式代理）三处统一使用。
+PLATFORM_REFERER = (
+    ("kuwo.cn", "http://www.kuwo.cn/"),
+    ("kugou.com", "http://www.kugou.com/"),
+    ("y.qq.com", "https://y.qq.com/"),
+    ("qq.com", "https://y.qq.com/"),
+    ("music.163.com", "https://music.163.com/"),
+    ("migu.cn", "http://music.migu.cn/"),
+    ("bilibili.com", "https://www.bilibili.com/"),
+    ("bilivideo.com", "https://www.bilibili.com/"),
+    ("joox.com", "https://www.joox.com/"),
+    ("douyin.com", "https://music.douyin.com/"),
+    ("soda", "https://music.douyin.com/"),
+)
+
+
+def stream_headers(url):
+    """取流请求头：平台直链大多校验 Referer，缺了会 403"""
+    h = {"User-Agent": UA_BROWSER, "Accept": "*/*"}
+    u = (url or "").lower()
+    for key, ref in PLATFORM_REFERER:
+        if key in u:
+            h["Referer"] = ref
+            break
+    return h
+
+
 def fetch_to_disk(sid, up_url, expected=0, timeout=90):
     """整首音频落盘。签名直链时效很短，落盘后播放与拖动都不再依赖它。"""
     os.makedirs(AUDIO_DIR, exist_ok=True)
     tmp = os.path.join(AUDIO_DIR, sid + ".part")
     try:
-        req = urllib.request.Request(up_url, headers={"User-Agent": UA_BROWSER})
+        req = urllib.request.Request(up_url, headers=stream_headers(up_url))
         with urllib.request.urlopen(req, timeout=timeout) as r:
             ext = audio_ext(r.headers.get("Content-Type"), up_url)
             n = 0
@@ -2295,24 +2334,21 @@ class H(BaseHTTPRequestHandler):
         name, artist, album, dur = song_detail(sid)
         meta_remember(sid, name, artist)
 
+        # 候选顺序遵循 ADR-1：**自有 Go 音源引擎是主力**；网易云（NetEase 系统）默认不参与取音源。
         cands, seen, ai_done = [], set(), False
-        if hit and hit[0] and hit[0] != REJECT_MARK:
-            cands.append((hit[0], hit[3] or "cache"))
-            seen.add(hit[0])
-        off, _sz = official_url(sid)
-        if off and off not in seen:
-            cands.append((off, "official"))
-            seen.add(off)
+        # 不再把「上次解析出的直链」当候选：国内平台直链寿命以分钟计，缓存它只会换来过期 403
+        # （实测日志「直链过期(403)，重新解析」）。重新解析只要 0.1–0.2 秒，永远拿新鲜的更划算。
+        # 音频文件缓存（整曲落盘）在后面单独命中，那才是真正值得复用的东西。
         if name:
-            res = go_resolve(name, artist, album, dur)
+            res = go_resolve(name, artist, album, dur)      # ② 自有 Go 音源引擎（多平台，主力）
             fb = (res or {}).get("url")
             if is_http(fb) and fb not in seen:
-                cands.append((fb, "fallback"))
+                cands.append((fb, "go"))
                 seen.add(fb)
-            elif not res or not is_http(fb):
-                print("[Enhancer] 换源无匹配 %s / %s: %s"
+            else:
+                print("[Enhancer] Go 引擎无匹配 %s / %s: %s"
                       % (name, artist, (res or {}).get("attempts")))
-                # 规则匹配不到：让模型在「同曲不同写法」的候选里判断（只接受同一录音）
+                # 规则匹配不到：让模型在「同曲不同写法」的候选里终审（只接受同一录音）
                 ai_done = True
                 picked = ai_pick_source(name, artist, album, dur)
                 if picked:
@@ -2321,10 +2357,16 @@ class H(BaseHTTPRequestHandler):
                     print("[Enhancer] AI 选源候选 %s / %s ← 平台 %s（%s，%s秒）"
                           % (name, artist, picked["source"],
                              picked["reason"], (picked.get("song") or {}).get("duration")))
-        outer = NETEASE_OUTER + urllib.parse.quote(sid)
-        if outer not in seen:
-            cands.append((outer, "netease-outer"))
-            seen.add(outer)
+        if ALLOW_OFFICIAL:
+            # ③ 网易云直链（默认关闭）：需要临时开回时置 ALLOW_OFFICIAL=1
+            off, _sz = official_url(sid)
+            if off and off not in seen:
+                cands.append((off, "official"))
+                seen.add(off)
+            outer = NETEASE_OUTER + urllib.parse.quote(sid)
+            if outer not in seen:
+                cands.append((outer, "netease-outer"))
+                seen.add(outer)
 
         up_url = ""
         rejected = 0
@@ -2341,6 +2383,20 @@ class H(BaseHTTPRequestHandler):
                 continue
             print("[Enhancer] %s 来源落盘失败(%s) %s" % (src, why, sid))
             up_url = up_url or cand
+
+            # 直链过期 / 被上游拒绝：立刻用 Go 引擎重新解析一次（签名链接寿命很短，重试往往就换到新链）
+            if src == "go" and why == "fetch_error" and name:
+                res2 = go_resolve(name, artist, album, dur)
+                fb2 = (res2 or {}).get("url")
+                if is_http(fb2) and fb2 not in seen:
+                    seen.add(fb2)
+                    print("[Enhancer] 直链失效，重新解析后重试 %s" % sid)
+                    lp, why2 = fetch_to_disk(sid, fb2, dur)
+                    if lp:
+                        build_entry(sid, fb2, dur, "go")
+                        print("[Enhancer] 重解析成功并落盘 %s (%s)" % (sid, name))
+                        return self.serve_audio_file(lp)
+                    print("[Enhancer] 重解析后仍失败(%s) %s" % (why2, sid))
 
         # 规则路径全军覆没（含候选都被判为片段）：给 AI 选源最后一次机会
         if not ai_done and name and rejected:
@@ -2369,7 +2425,7 @@ class H(BaseHTTPRequestHandler):
         rng = self.headers.get("Range")
         for attempt in (1, 2):
             try:
-                hdr = {"User-Agent": "Mozilla/5.0"}
+                hdr = stream_headers(up_url)      # 流式代理同样要带平台 Referer
                 if rng:
                     hdr["Range"] = rng
                 with urllib.request.urlopen(urllib.request.Request(up_url, headers=hdr),
@@ -2574,7 +2630,8 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 
 
 if __name__ == "__main__":
-    print("[R-Music] Enhancer 启动 端口=%s 适配器=%s 换源=%s" % (PORT, GO_ADAPTER, FALLBACK_SOURCES))
+    print("[R-Music] Enhancer 启动 端口=%s 适配器=%s 换源=%s 网易云直链=%s"
+          % (PORT, GO_ADAPTER, FALLBACK_SOURCES, "开" if ALLOW_OFFICIAL else "关（Go 引擎为主力）"))
     du, ac = disk_usage(), audio_cache_stats()
     print("[R-Music] 磁盘 %.0f%%（剩 %.1fG）缓存 %d 首 / %.0fMB"
           % (du["used_pct"], du["free_gb"], ac["files"], ac["mb"]))

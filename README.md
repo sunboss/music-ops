@@ -163,4 +163,5 @@ music-ops/
 | `docs/AI-MUSIC-SYSTEM.md` | 系统定义展开版：数据流、决策记录、路线图 |
 | `docs/REWRITE_PLAN.md` | 前端重写方案与上线/回滚流程 |
 | `docs/MA_INTEGRATION.md` | 给 Home Assistant / Music Assistant 的接入说明 |
+| `docs/PITFALLS.md` | **踩坑存档**：部署/音源/验收/投屏/协作各一条规则，防止重复犯错 |
 | `MAINTENANCE.md` | 运维手册：排查命令、故障处理、Cloudflare 版本号规则 |
