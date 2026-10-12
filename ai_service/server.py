@@ -26,6 +26,32 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import socketserver
 
 PORT = int(os.getenv("PORT", "3001"))
+# ---------------------------------------------------------------- AI 网关
+# 大模型网关（OpenAI 兼容）。密钥只从环境变量读，绝不写进代码或日志。
+AI_GATEWAY = os.getenv("AI_GATEWAY", "https://api.1234r.com/v1")
+AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
+
+
+def _load_ai_key():
+    """密钥优先取环境变量；否则读挂载文件（不写进代码、不打印、不提交）。
+    文件路径：容器内 /data/ai_key.txt（对应服务器 data/ai_key.txt）"""
+    v = (os.getenv("AI_API_KEY") or "").strip()
+    if v:
+        return v
+    for f in (os.getenv("AI_API_KEY_FILE", ""), "/data/ai_key.txt"):
+        if not f:
+            continue
+        try:
+            with open(f, "r") as fh:
+                t = fh.read().strip()
+            if t:
+                return t
+        except Exception:
+            pass
+    return ""
+
+
+AI_API_KEY = _load_ai_key()
 MUSIC_API_UPSTREAM = os.getenv("MUSIC_API_UPSTREAM", "http://music-api:3000")
 GO_ADAPTER = os.getenv("GO_ADAPTER", "http://go-adapter:8811")
 FALLBACK_SOURCES = os.getenv("FALLBACK_SOURCES", "kuwo,jamendo")
@@ -163,6 +189,70 @@ def go_resolve(name, artist, album, dur):
     except Exception as e:
         print("[Enhancer] Go 适配器不可用: %s" % e)
         return None
+
+
+def ai_enabled():
+    return bool(AI_API_KEY.strip())
+
+
+def ai_chat(messages, timeout=40, temperature=0.3, json_mode=True):
+    """调用大模型网关；返回助手回复文本。失败抛出异常（由调用方明确报错）"""
+    if not ai_enabled():
+        raise RuntimeError("未配置 AI_API_KEY")
+    body = {"model": AI_MODEL, "messages": messages, "temperature": temperature}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    req = urllib.request.Request(
+        AI_GATEWAY.rstrip("/") + "/chat/completions",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + AI_API_KEY.strip()})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.loads(r.read().decode("utf-8"))
+    return (d.get("choices") or [{}])[0].get("message", {}).get("content", "")
+
+
+PLAN_PROMPT = (
+    "你是音乐检索助手。把用户的中文自然语言需求转成 JSON（只输出 JSON，不要解释）：\n"
+    '{"keywords":["用于音乐平台搜索的词",...],"artist":"歌手名，没有则空串",'
+    '"mood":"情绪或场景，没有则空串","count":5,"reply":"一句简短中文回复"}\n'
+    "要求：keywords 用具体可检索的歌名/歌手/主题词，2-3 个，不要整句话；"
+    "count 取 3-10；reply 用用户的语言回答。")
+
+
+def ai_plan(text):
+    """让大模型把自然语言变成结构化检索条件"""
+    out = ai_chat([{"role": "system", "content": PLAN_PROMPT},
+                   {"role": "user", "content": text}])
+    plan = json.loads(out)
+    if not isinstance(plan.get("keywords"), list) or not plan["keywords"]:
+        plan["keywords"] = [text]
+    plan["keywords"] = [str(k) for k in plan["keywords"]][:3]
+    try:
+        plan["count"] = max(1, min(10, int(plan.get("count") or 5)))
+    except Exception:
+        plan["count"] = 5
+    return plan
+
+
+def search_songs(keyword, limit=5):
+    """走官方搜索接口取歌（与站点搜索同一数据源）"""
+    try:
+        with _open(MUSIC_API_UPSTREAM + "/cloudsearch?keywords=" +
+                   urllib.parse.quote(keyword) + "&type=1&limit=%d" % limit,
+                   {"User-Agent": "R-Music-Enhancer"}, 12) as r:
+            d = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        print("[Enhancer] AI 搜索失败 %s: %s" % (keyword, e))
+        return []
+    out = []
+    for s in ((d.get("result") or {}).get("songs") or []):
+        al = s.get("al") or {}
+        out.append({"id": s.get("id"), "name": s.get("name"),
+                    "artist": " / ".join(a.get("name", "") for a in (s.get("ar") or [])),
+                    "album": al.get("name") or "",
+                    "duration": round((s.get("dt") or 0) / 1000.0, 1)})
+    return out
 
 
 def is_http(u):
@@ -587,6 +677,42 @@ class H(BaseHTTPRequestHandler):
                 "freeTrialInfo": None, "level": None, "source": source or "fallback",
                 "expi": CACHE_TTL}
 
+    # ------------------------------------------------------------ AI 点歌
+    def handle_ai_query(self, query, body=None):
+        """自然语言点歌：大模型把一句话变成检索条件 -> 官方搜索 -> 返回可点播的歌曲列表"""
+        text = ""
+        if body:
+            try:
+                text = (json.loads(body.decode("utf-8", "ignore")) or {}).get("q", "")
+            except Exception:
+                text = ""
+        if not text:
+            prm = urllib.parse.parse_qs(query or "")
+            text = (prm.get("q", [""])[0] or "").strip()
+        text = (text or "").strip()
+        if not text:
+            return self._json(400, {"error": "缺少 q 参数"})
+        if not ai_enabled():
+            return self._json(503, {"error": "AI 未配置：请在服务端设置 AI_API_KEY（大模型网关 token）",
+                                    "gateway": AI_GATEWAY, "model": AI_MODEL})
+        try:
+            plan = ai_plan(text)
+        except Exception as e:
+            print("[Enhancer] AI 解析失败: %s" % e)
+            return self._json(502, {"error": "AI 解析失败: %s" % str(e)[:160]})
+
+        songs, seen = [], set()
+        for kw in plan["keywords"]:
+            for s in search_songs(kw, plan["count"]):
+                if s["id"] and s["id"] not in seen:
+                    seen.add(s["id"])
+                    songs.append(s)
+            if len(songs) >= plan["count"]:
+                break
+        songs = songs[:plan["count"]]
+        print("[Enhancer] AI 点歌 %r -> 关键词 %s, 返回 %d 首" % (text[:24], plan["keywords"], len(songs)))
+        return self._json(200, {"reply": plan.get("reply") or "", "plan": plan, "songs": songs})
+
     # ------------------------------------------------------------ 单曲诊断
     def handle_debug_song(self, query):
         """排查用：说明某首歌会被怎么处理、最终音频真实多长。
@@ -831,13 +957,16 @@ class H(BaseHTTPRequestHandler):
         real = p.path[4:] if p.path.startswith("/api/") else p.path
         if real == "/version":
             return self._json(200, {"build": BUILD, "started": START_TS,
-                                    "sources": FALLBACK_SOURCES, "cache": CACHE_TTL})
+                                    "sources": FALLBACK_SOURCES, "cache": CACHE_TTL,
+                                    "ai": ai_enabled(), "ai_model": AI_MODEL if ai_enabled() else ""})
         if real == "/song/url":
             return self.handle_song_url(p.query)
         if real == "/audio/proxy":
             return self.handle_audio_proxy(p.query)
         if real == "/debug/song":
             return self.handle_debug_song(p.query)
+        if real == "/ai/query":
+            return self.handle_ai_query(p.query)
         return self.proxy_upstream(real, p.query)
 
     def do_POST(self):
@@ -845,6 +974,9 @@ class H(BaseHTTPRequestHandler):
         real = p.path[4:] if p.path.startswith("/api/") else p.path
         if real == "/client-report":
             return self.handle_client_report()
+        if real == "/ai/query":
+            ln = int(self.headers.get("Content-Length", 0) or 0)
+            return self.handle_ai_query(p.query, self.rfile.read(ln) if ln else b"")
         return self.proxy_upstream(real, p.query)
 
     def handle_client_report(self):
