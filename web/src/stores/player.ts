@@ -30,6 +30,7 @@ export const usePlayerStore = defineStore("player", {
     showQueue: false,         // 播放队列抽屉
     autoContinue: localStorage.getItem("autoContinue") !== "0",   // 无限电台：队列快空时 AI 自动续歌
     continuing: false,
+    _prefetch: new Map<number, any>() as Map<number, any>,   // 下一首预取结果（不进持久化）
     showCast: false,          // 备用设备小菜单（只有浏览器没有原生投屏能力时才出现）
     castMode: "off" as "off" | "airplay" | "remote" | "dlna" | "ha",   // 当前投屏通道
     castEntity: "",           // 经 HA 投屏时的实体 id
@@ -229,7 +230,8 @@ export const usePlayerStore = defineStore("player", {
       void this.loadLyrics();
 
       try {
-        const item = await api.songUrl(song.id);
+        const item = this._prefetch.get(song.id) || await api.songUrl(song.id);
+        this._prefetch.delete(song.id);
         if (!item?.url || item.source === "no-source") {
           song.playable = false;
           this.loading = false;
@@ -246,6 +248,11 @@ export const usePlayerStore = defineStore("player", {
         playStart = Date.now();
         await el.play().catch(() => { this.loading = false; });
         this.loading = false;
+        // 起播成功即预取下一首地址（后台，不打扰当前播放）
+        const nx = this.queue[i + 1];
+        if (nx && nx.id && !this._prefetch.has(nx.id)) {
+          void api.songUrl(nx.id).then(r => { if (r?.url) this._prefetch.set(nx.id, r); }).catch(() => {});
+        }
       } catch {
         this.loading = false;
         this.error = "取源失败";

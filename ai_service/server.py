@@ -187,11 +187,18 @@ def _open(url, headers=None, timeout=10, data=None):
                                   timeout=timeout)
 
 
+_detail_cache = {}          # sid -> (monotonic_ts, (name, artist, album, dur))
+_DETAIL_TTL = 3600          # 元数据基本不变，缓存 1 小时
+
+
 def song_detail(sid):
-    """返回 (name, artist, album, duration_seconds)"""
+    """返回 (name, artist, album, duration_seconds)；带内存 TTL 缓存（起播提速）"""
     sid = str(sid or "").strip()     # 防御：调用方可能传整数 id
     if not sid:
         return "", "", "", 0
+    hit = _detail_cache.get(sid)
+    if hit and time.monotonic() - hit[0] < _DETAIL_TTL:
+        return hit[1]
     try:
         with _open(MUSIC_API_UPSTREAM + "/song/detail?ids=" + sid,
                    {"User-Agent": "R-Music-Enhancer"}, 4) as r:
@@ -199,7 +206,11 @@ def song_detail(sid):
         s = (d.get("songs") or [{}])[0]
         artist = " ".join([a.get("name", "") for a in s.get("ar", []) if a.get("name")])
         album = ((s.get("al") or {}).get("name") or "")
-        return s.get("name", ""), artist, album, int(s.get("dt", 0) or 0) // 1000
+        out = (s.get("name", ""), artist, album, int(s.get("dt", 0) or 0) // 1000)
+        if len(_detail_cache) > 2000:      # 防膨胀
+            _detail_cache.clear()
+        _detail_cache[sid] = (time.monotonic(), out)
+        return out
     except Exception as e:
         print("[Enhancer] 取歌曲信息失败 %s: %s" % (sid, e))
         return "", "", "", 0
@@ -1891,23 +1902,29 @@ class H(BaseHTTPRequestHandler):
                 _, size, br, src = hit
                 return self._json(200, {"code": 200, "data": [self._item(sid, size, br, src)]})
 
+        code, body = None, None
+        off_url = None
+        data = None
         # 问官方：只用于判断「有没有音源」和取 size/br。
         # 播放地址一律走本服务的代理——官方直链可能是 30 秒试听，直接交给播放器会只播 30 秒。
-        code, body = self._up("/song/url", query)
-        data = None
-        off_url = None
-        try:
-            data = json.loads(body.decode("utf-8"))
-            it = (data.get("data") or [{}])[0]
-            if it.get("url") and not it.get("freeTrialInfo"):
-                off_url = fix_url(it["url"])
-        except Exception:
-            data = None
+        # 同时并行取元数据（song_detail ~0.7s）：两条请求互不依赖，串行白等
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
+            f_off = _ex.submit(self._up, "/song/url", query)
+            f_meta = _ex.submit(song_detail, sid)
+            code, body = f_off.result()
+            try:
+                data = json.loads(body.decode("utf-8"))
+                it = (data.get("data") or [{}])[0]
+                if it.get("url") and not it.get("freeTrialInfo"):
+                    off_url = fix_url(it["url"])
+            except Exception:
+                data = None
+            name, artist, album, dur = f_meta.result()
 
         if not sid:
             return self._json(200, strip_trial(data) or {"code": 404, "data": []})
 
-        name, artist, album, dur = song_detail(sid)
         if not name:
             return self._json(200, strip_trial(data) or {"code": 404, "data": []})
         dur = dur or 0
