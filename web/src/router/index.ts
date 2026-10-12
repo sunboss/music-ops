@@ -9,6 +9,7 @@ const routes = [
   { path: "/fm", name: "fm", component: () => import("@/views/FMView.vue") },
   { path: "/playlist/:id", name: "playlist", component: () => import("@/views/PlaylistView.vue") },
   { path: "/album/:id", name: "album", component: () => import("@/views/AlbumView.vue") },
+  { path: "/artists", name: "artists", component: () => import("@/views/ArtistsView.vue") },
   { path: "/artist/:id", name: "artist", component: () => import("@/views/ArtistView.vue") },
   { path: "/search/:keywords?", name: "search", component: () => import("@/views/SearchView.vue") },
   { path: "/daily/songs", name: "daily", component: () => import("@/views/DailyView.vue") },

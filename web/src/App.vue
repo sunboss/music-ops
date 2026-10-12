@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { RouterView, useRouter, useRoute } from "vue-router";
-import { Search, Sparkles, House, Compass, Library, ChevronLeft, Radio } from "lucide-vue-next";
+import { Search, Sparkles, House, Compass, Library, ChevronLeft, Radio, MicVocal } from "lucide-vue-next";
 import PlayerBar from "@/components/PlayerBar.vue";
 import FullPlayer from "@/components/FullPlayer.vue";
 import QueueDrawer from "@/components/QueueDrawer.vue";
@@ -17,6 +17,7 @@ const kw = ref("");
 const navs = [
   { to: "/", label: "首页", icon: House },
   { to: "/explore", label: "发现", icon: Compass },
+  { to: "/artists", label: "歌手", icon: MicVocal },
   { to: "/library", label: "音乐库", icon: Library },
   { to: "/ai", label: "AI 音乐", icon: Sparkles },
   { to: "/fm", label: "私人 FM", icon: Radio },
@@ -33,6 +34,7 @@ const pageTitle = computed(() => {
   if (p.startsWith("/search")) return "搜索";
   if (p.startsWith("/daily")) return "每日推荐";
   if (p.startsWith("/explore")) return "发现";
+  if (p.startsWith("/artists") || p.startsWith("/artist")) return "歌手";
   if (p.startsWith("/library")) return "音乐库";
   if (p.startsWith("/ai")) return "AI 音乐";
   if (p.startsWith("/fm")) return "私人 FM";

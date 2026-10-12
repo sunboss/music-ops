@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { House, Compass, Library, Sparkles } from "lucide-vue-next";
+import { House, Compass, Library, Sparkles, MicVocal } from "lucide-vue-next";
 import { useRoute, useRouter } from "vue-router";
 
 const route = useRoute();
@@ -7,6 +7,7 @@ const router = useRouter();
 const tabs = [
   { to: "/", icon: House, label: "首页" },
   { to: "/explore", icon: Compass, label: "发现" },
+  { to: "/artists", icon: MicVocal, label: "歌手" },
   { to: "/library", icon: Library, label: "音乐库" },
   { to: "/ai", icon: Sparkles, label: "AI" },
 ];

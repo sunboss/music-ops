@@ -1,5 +1,5 @@
 import axios from "axios";
-import type { AlbumDetail, Playlist, Song, SongUrlItem, ArtistDetail } from "./types";
+import type { AlbumDetail, Playlist, Song, SongUrlItem, ArtistDetail, ArtistItem } from "./types";
 
 /** 所有请求都走 nginx 的 /api/* → 增强服务（换源、AI、音频代理都在那边） */
 const http = axios.create({ baseURL: "/api", timeout: 30000 });
@@ -59,6 +59,12 @@ export const api = {
   async artistAlbums(id: number | string, limit = 30) {
     const { data } = await http.get("/artist/album", { params: { id, limit } });
     return data.hotAlbums || [];
+  },
+
+  /** 歌手列表：area -1全部/7华语/96欧美/8日本/16韩国；type -1全部/1男/2女/3乐队 */
+  async artistList(area = -1, type = -1, limit = 60): Promise<ArtistItem[]> {
+    const { data } = await http.get("/artist/list", { params: { area, type, limit } });
+    return (data.artists || []) as ArtistItem[];
   },
 
   async search(keywords: string, type = 1, limit = 30, offset = 0) {

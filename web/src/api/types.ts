@@ -23,6 +23,11 @@ export interface ArtistDetail {
   id: number; name: string; picUrl?: string; briefDesc?: string;
   albumSize?: number; musicSize?: number; mvSize?: number;
 }
+/** 歌手列表条目（/artist/list 返回：头像、别名、作品数） */
+export interface ArtistItem {
+  id: number; name: string; picUrl?: string; alias?: string[];
+  albumSize?: number; musicSize?: number;
+}
 export interface AlbumDetail extends AlbumMeta {
   artist?: Artist; publishTime?: number; description?: string;
 }
