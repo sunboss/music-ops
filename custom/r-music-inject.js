@@ -3,7 +3,7 @@
  * 仅保留：顶部导航栏品牌 Logo；并清除旧版 Service Worker 缓存，保证增强脚本生效
  */
 (function () {
-  window.__RM_VERSION = "20261012v";
+  window.__RM_VERSION = "20261012w";
 
   (async function killOldServiceWorker() {
     try {
@@ -395,6 +395,7 @@
         if (d.title) document.getElementById("rm-ai-title").textContent = d.title;
         var n = (d.songs || []).filter(function (s) { return s.playable !== false; }).length;
         repEl.textContent = (d.reply || "") + (radio ? "　共 " + n + " 首可播" : "");
+        if (d.picked) { repEl.textContent += "，" + d.picked + " 首为 AI 精选"; }
         Q.list = d.songs || []; Q.i = -1;
         draw();
         if (radio && Q.list.length) {
