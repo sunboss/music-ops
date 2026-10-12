@@ -191,6 +191,43 @@ def song_detail(sid):
         return "", "", "", 0
 
 
+PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "https://music.1234r.com").rstrip("/")
+
+
+def song_cover(sid):
+    """封面直链（取不到就返回空，不编造）"""
+    try:
+        with _open(MUSIC_API_UPSTREAM + "/song/detail?ids=" + str(sid),
+                   {"User-Agent": "R-Music-Enhancer"}, 5) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        return ((d.get("songs") or [{}])[0].get("al") or {}).get("picUrl") or ""
+    except Exception:
+        return ""
+
+
+def _tracks_from(path, key, sub=None):
+    """从网易云上游取一批歌曲（歌单/专辑通用）"""
+    try:
+        with _open(MUSIC_API_UPSTREAM + path, {"User-Agent": "R-Music-Enhancer"}, 8) as r:
+            d = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        print("[Enhancer] 取曲目失败 %s: %s" % (path, str(e)[:80]))
+        return []
+    songs = d.get(key) or []
+    if sub:
+        songs = ((d.get(sub) or {}).get(key) or [])
+    return [s for s in songs if s.get("id")]
+
+
+def playlist_tracks(pid, limit=100):
+    """歌单全部曲目（匿名也能取）"""
+    return _tracks_from("/playlist/track/all?id=%s&limit=%d" % (pid, limit), "songs")
+
+
+def album_tracks(aid):
+    return _tracks_from("/album?id=%s" % aid, "songs")
+
+
 def measure_size(url, sid=None):
     """用 Range 取真实总字节数；取不到返回 0（不编造）"""
     if sid:
@@ -648,6 +685,57 @@ def _private_host(host):
         except Exception:
             return False
     return False
+
+
+AUDIO_MAGIC = (
+    (b"fLaC", "audio/flac"),
+    (b"ID3", "audio/mpeg"),
+    (b"OggS", "audio/ogg"),
+    (b"RIFF", "audio/wav"),
+)
+
+
+def sniff_audio_type(head):
+    """按容器魔数判断音频类型（上游常把 flac 标成 octet-stream，播放器会选错解码器）"""
+    if head[:4] == b"\xff\xf1" or head[:2] == b"\xff\xfb" or head[:2] == b"\xff\xf3":
+        return "audio/mpeg"
+    if head[4:8] == b"ftyp":
+        return "audio/mp4"
+    for magic, ctype in AUDIO_MAGIC:
+        if head.startswith(magic):
+            return ctype
+    return ""
+
+
+def probe_audio_headers(url):
+    """HEAD 用：只发一个 16 字节的 Range 请求，拿真实类型与总长度，不拉整曲"""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": UA_BROWSER, "Accept": "*/*", "Range": "bytes=0-15"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            head = r.read(16) or b""
+            cr = r.headers.get("Content-Range") or ""
+            ct = r.headers.get("Content-Type") or ""
+            total = 0
+            if "/" in cr:
+                try:
+                    total = int(cr.rsplit("/", 1)[1])
+                except Exception:
+                    total = 0
+            if not total:
+                try:
+                    total = int(r.headers.get("Content-Length") or 0)
+                except Exception:
+                    total = 0
+            sniffed = sniff_audio_type(head)
+            if sniffed:
+                ct = sniffed
+            elif not ct.startswith("audio/"):
+                ct = "audio/mpeg"
+            return ct, total
+    except Exception as e:
+        print("[Enhancer] HEAD 探测失败: %s" % str(e)[:90])
+        return "audio/mpeg", 0
 
 
 def referer_allowed(handler):
@@ -1581,11 +1669,20 @@ def fix_url(u):
     return u
 
 
+HEAD_ONLY = {}
+
+
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):
         pass
+
+    def _wbody(self, b):
+        """写响应体；HEAD 请求只发头不发体（否则 keep-alive 的帧会错位）"""
+        if HEAD_ONLY.get(id(self)):
+            return
+        self.wfile.write(b)
 
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -1600,7 +1697,7 @@ class H(BaseHTTPRequestHandler):
         self._cors()
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
-        self.wfile.write(b)
+        self._wbody(b)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -2010,6 +2107,8 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
         self._cors()
         self.end_headers()
+        if HEAD_ONLY.get(id(self)):
+            return                      # HEAD：头部已发完，不读文件
         try:
             with open(path, "rb") as f:
                 f.seek(start)
@@ -2024,6 +2123,116 @@ class H(BaseHTTPRequestHandler):
             pass   # 播放器拖动时会主动断开旧连接，属正常
 
     # ------------------------------------------------------------ 音频代理
+    # ------------------------------------------------------------ Music Assistant / HA 桥
+    def _ma_pick_sid(self, prm):
+        """把「歌曲 id」或「一句话」解析成一个可播放的歌曲 id"""
+        sid = (prm.get("id", [""])[0] or "").strip()
+        if sid:
+            return sid
+        q = (prm.get("q", [""])[0] or "").strip()
+        if not q:
+            return ""
+        want = 0
+        try:
+            want = int(prm.get("i", ["0"])[0])
+        except Exception:
+            want = 0
+        songs = []
+        is_url = q.startswith("http")
+        if not is_url:
+            try:
+                _code, payload = self._query_payload("q=" + urllib.parse.quote(q))
+                songs = payload.get("songs") or []
+            except Exception as e:
+                print("[Enhancer] MA 桥点歌失败: %s" % str(e)[:90])
+            if not songs:      # 点歌没命中就退化成电台
+                try:
+                    _code, payload = self._radio_payload(q, 8)
+                    songs = payload.get("songs") or []
+                except Exception as e:
+                    print("[Enhancer] MA 桥电台失败: %s" % str(e)[:90])
+        # 也允许直接传一个音频直链
+        if is_url:
+            return "url:" + q
+        if not songs:
+            return ""
+        idx = max(0, min(want, len(songs) - 1))
+        # 同一批结果里优先没有版本标记的（用户没点名要 Live/翻唱/伴奏时别给这些）
+        if not any(m in q.lower() for m in ("live", "现场", "翻唱", "伴奏", "remix")):
+            clean = [i for i, s in enumerate(songs) if not _markers(s.get("name") or "")]
+            if clean:
+                idx = clean[min(idx, len(clean) - 1)]
+        return str(songs[idx].get("id") or "")
+
+    def handle_ma_play(self, query):
+        """给 Music Assistant / HA 用的「一个 URL 即一句话点歌」：
+        /api/ma/play?q=周杰伦的晴天 或 ?id=186016 —— 直接把音频流出去（支持 Range）"""
+        prm = urllib.parse.parse_qs(query or "")
+        sid = self._ma_pick_sid(prm)
+        if not sid:
+            print("[Enhancer] MA 桥未找到可播放曲目 q=%s" % (prm.get("q", [""])[0])[:40])
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain;charset=utf-8")
+            self.send_header("Content-Length", "0")
+            self._cors()
+            self.end_headers()
+            return
+        if sid.startswith("url:"):
+            return self.handle_audio_proxy("id=" + urllib.parse.quote(sid[4:]))
+        print("[Enhancer] MA 桥播放 id=%s（q=%s）"
+              % (sid, (prm.get("q", [""])[0] or "")[:30]))
+        return self.handle_audio_proxy("id=" + sid)
+
+    def handle_ma_resolve(self, query):
+        """返回 JSON 元数据（HA 脚本/传感器要用 URL 时用这个）"""
+        prm = urllib.parse.parse_qs(query or "")
+        sid = self._ma_pick_sid(prm)
+        if not sid:
+            return self._json(404, {"ok": False, "error": "没找到可播放的曲目"})
+        name, artist, album, dur = song_detail(sid)
+        return self._json(200, {
+            "ok": True, "id": sid, "title": name, "artist": artist, "album": album,
+            "duration": dur, "cover": song_cover(sid),
+            "url": "%s/api/audio/proxy?id=%s" % (PUBLIC_BASE, sid),
+            "stream": "%s/api/ma/play?id=%s" % (PUBLIC_BASE, sid),
+        })
+
+    def handle_ma_m3u(self, query):
+        """M3U 播放清单：支持一句话电台(?q=)、歌单(?pid=)、专辑(?aid=)"""
+        prm = urllib.parse.parse_qs(query or "")
+        songs = []
+        q = (prm.get("q", [""])[0] or "").strip()
+        pid = (prm.get("pid", [""])[0] or "").strip()
+        aid = (prm.get("aid", [""])[0] or "").strip()
+        if pid:
+            songs = playlist_tracks(pid)
+        elif aid:
+            songs = album_tracks(aid)
+        elif q:
+            _code, payload = self._radio_payload(q, 20)
+            songs = payload.get("songs") or []
+        out = ["#EXTM3U"]
+        for s in songs[:50]:
+            ar = "、".join(a.get("name", "") for a in (s.get("ar") or []))
+            out.append("#EXTINF:%d,%s - %s" % (int(s.get("dt", 0) // 1000), ar, s.get("name", "")))
+            out.append("%s/api/audio/proxy?id=%s" % (PUBLIC_BASE, s.get("id")))
+        body = ("\n".join(out) + "\n").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/x-mpegurl;charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self._cors()
+        self.end_headers()
+        self._wbody(body)
+
+    def _send_audio_head(self, ctype, size):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(size))
+        self._cors()
+        self.end_headers()
+
     def handle_audio_proxy(self, query):
         # 防盗链：外站把自己的页面挂上我们的音频地址会被这里挡住
         if not referer_allowed(self):
@@ -2042,6 +2251,27 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+
+        if HEAD_ONLY.get(id(self)):
+            # HEAD：只回头部（MA / ffmpeg / DLNA 渲染器都会先探测），
+            # 已落盘的直接报本地文件大小，否则用 16 字节 Range 探测上游，绝不拉整曲
+            lp = audio_cached(sid)
+            if lp:
+                size = os.path.getsize(lp)
+                ct = ("audio/mp4" if lp.endswith((".m4a", ".mp4"))
+                      else ("audio/flac" if lp.endswith(".flac") else "audio/mpeg"))
+                return self._send_audio_head(ct, size)
+            name, artist, album, dur = song_detail(sid)
+            off, osz = official_url(sid)
+            cand = off
+            if not is_http(cand) and name:
+                cand = (go_resolve(name, artist, album, dur) or {}).get("url")
+            if is_http(cand):
+                ct, size = probe_audio_headers(cand)
+                if size:
+                    return self._send_audio_head(ct, size)
+            print("[Enhancer] HEAD 探测不到长度，转正常解析 id=%s" % sid)
+            # 落到下面的常规流程：落盘后用本地文件长度回头部（只是慢，不会失败）
 
         rng_log = self.headers.get("Range") or "全量"
         print("[Enhancer] 播放请求 id=%s 范围=%s UA=%s" % (
@@ -2225,7 +2455,7 @@ class H(BaseHTTPRequestHandler):
         self._cors()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self._wbody(body)
 
     def do_GET(self):
         p = urllib.parse.urlparse(self.path)
@@ -2251,6 +2481,12 @@ class H(BaseHTTPRequestHandler):
             return self.handle_debug_song(p.query)
         if real == "/ai/query":
             return self.handle_ai_query(p.query)
+        if real in ("/ma/play", "/ma/stream"):
+            return self.handle_ma_play(p.query)
+        if real == "/ma/resolve":
+            return self.handle_ma_resolve(p.query)
+        if real == "/ma/m3u":
+            return self.handle_ma_m3u(p.query)
         if real == "/ai/continue":
             return self.handle_ai_continue(p.query)
         if real == "/ai/radio":
@@ -2262,6 +2498,17 @@ class H(BaseHTTPRequestHandler):
                 want = 18
             return self.handle_ai_radio(q, min(30, max(5, want)))
         return self.proxy_upstream(real, p.query)
+
+    def do_HEAD(self):
+        """播放器（Music Assistant / ffmpeg / DLNA）探测用。
+        只回头部：音频代理走轻量探测，其余接口照常算但丢弃响应体。"""
+        HEAD_ONLY[id(self)] = True
+        try:
+            self.do_GET()          # 响应头照常输出，响应体由 _wbody 拦掉
+        except Exception as e:
+            print("[Enhancer] HEAD 处理失败: %s" % str(e)[:90])
+        finally:
+            HEAD_ONLY.pop(id(self), None)
 
     def do_POST(self):
         p = urllib.parse.urlparse(self.path)
