@@ -206,6 +206,9 @@ def ai_chat(messages, timeout=40, temperature=0.3, json_mode=True):
         AI_GATEWAY.rstrip("/") + "/chat/completions",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json",
+                 # 网关前置了 Cloudflare，缺少浏览器形态的 UA 会被 403 拦掉
+                 "User-Agent": UA_BROWSER,
+                 "Accept": "application/json",
                  "Authorization": "Bearer " + AI_API_KEY.strip()})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         d = json.loads(r.read().decode("utf-8"))
@@ -220,11 +223,21 @@ PLAN_PROMPT = (
     "count 取 3-10；reply 用用户的语言回答。")
 
 
+def _strip_fence(s):
+    """模型常把 JSON 包在 ```json 代码块里，这里剥掉"""
+    t = (s or "").strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else t
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    return t.strip()
+
+
 def ai_plan(text):
     """让大模型把自然语言变成结构化检索条件"""
     out = ai_chat([{"role": "system", "content": PLAN_PROMPT},
                    {"role": "user", "content": text}])
-    plan = json.loads(out)
+    plan = json.loads(_strip_fence(out))
     if not isinstance(plan.get("keywords"), list) or not plan["keywords"]:
         plan["keywords"] = [text]
     plan["keywords"] = [str(k) for k in plan["keywords"]][:3]

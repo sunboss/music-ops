@@ -42,6 +42,10 @@ services:
       - GO_ADAPTER=http://go-adapter:8811
       - FALLBACK_SOURCES=kuwo,jamendo
       - DATA_DIR=/data
+      # AI 点歌：大模型网关（密钥从挂载文件 /data/ai_key.txt 读取，不进代码/日志/仓库）
+      - AI_GATEWAY=https://api.1234r.com/v1
+      - AI_MODEL=gemini-3.1-flash-lite
+      - AI_API_KEY_FILE=/data/ai_key.txt
     deploy:
       resources:
         limits:
