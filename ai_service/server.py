@@ -1657,6 +1657,15 @@ def fetch_to_disk(sid, up_url, expected=0, timeout=90, via_adapter=False):
                 continue
             final = os.path.join(AUDIO_DIR, sid + ext)
             os.replace(tmp, final)
+            # 以真实容器为准纠正扩展名（实测出现 .mp3 里装 M4A/FLAC 的情况，播放器会因此解不开）
+            sniffed = sniff_audio_type(open(final, "rb").read(16))
+            want = {"audio/flac": ".flac", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+                    "audio/ogg": ".ogg", "audio/wav": ".wav"}.get(sniffed, "")
+            if want and want != ext and ext in (".mp3", ".m4a", ".mp4", ".flac", ".ogg", ".wav"):
+                fixed = os.path.join(AUDIO_DIR, sid + want)
+                os.replace(final, fixed)
+                print("[Enhancer] 扩展名不符(%s->%s)，已按真实容器改名 %s" % (ext, want, sid))
+                final = fixed
             ok, actual = duration_ok(final, expected)
             if not ok:
                 try:

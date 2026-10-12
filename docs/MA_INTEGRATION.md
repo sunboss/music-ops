@@ -99,6 +99,59 @@ R-Music 播放过的整曲会落盘在东京服务器 `/data/sunboss/music/data/
 
 > 注意：缓存文件不带完整 ID3 标签，MA 只能按文件名显示。要标签齐全就需要额外做一次元数据导出（可以再加接口）。
 
+## 1b. 把 R-Music 变成 MA 的曲库（Filesystem 提供方）—— 「怎么添加我们的数据」
+
+**先说清为什么不能直接填我们的接口**：Music Assistant **没有"通用 HTTP/JSON"提供方**。
+它接受的是 Spotify/Tidal/Qobuz/Deezer/YouTube Music/Apple Music/SoundCloud/Plex/Jellyfin/
+Subsonic/radio-browser，以及 **Filesystem（本地或网络文件夹）**。
+所以要把我们的数据变成 MA 的曲库，唯一务实的路是：**把它做成一个"带标签的文件夹"**。
+
+### 三步
+
+**① 服务器上生成带标签曲库**（工具：`tools/build-library.py`，已跑过一次）
+
+```bash
+# 东京机；用 Docker 跑，不污染宿主机
+docker run --rm -v /data/sunboss/music/data:/data -v /data/sunboss/music/tools:/tools \
+  python:3.11-alpine sh -c "pip install -q mutagen && python /tools/build-library.py \
+    --cache /data/audio_cache --out /data/library"
+```
+
+它做四件事：读缓存里的 `<歌曲ID>.<ext>` → 用网易云（目录层）换到 标题/歌手/专辑/年代/封面 →
+写入标签（MP3→ID3v2.3、FLAC→Vorbis Comment、M4A→MP4 atoms）并嵌入封面 →
+另存为 `歌手 - 歌名.ext` + 生成 `library.m3u8`。
+
+实测：**56 首全部带标签，405 MB**；顺带发现并纠正了 **11 个扩展名与实际容器不符**的文件
+（上游 Content-Type 谎报，例如 `.aac` 里其实是 M4A）——服务端落盘逻辑已一并修正，以后不会再产生。
+
+**② 同步到 MA 能读到的地方**（工具：`tools/library-sync.sh`，本机跑）
+
+```bash
+bash tools/library-sync.sh                 # 默认同步到 ~/Music/R-Music
+TARGET=/Volumes/media/R-Music bash tools/library-sync.sh   # 或直接同步到 HA 的 media 共享
+```
+
+实测：424 MB / 55 首，从东京拉回约 2.3 MB/s。
+**为什么是"拉"不是"推"**：本机有到服务器的密钥、服务器没有到本机的，而且**不需要把 SMB/NFS
+暴露到公网**（445/2049 是被扫描最凶的端口）。
+
+**③ 在 Music Assistant 里添加**
+
+```
+MA → 设置 → 添加音乐提供方 → Filesystem（本地/网络文件夹）→ 路径填上一步的目录 → 保存并扫描
+```
+
+- MA 与 HA 同机（HAOS 插件）时：**最省事是把曲库放进 HA 的 `/media` 目录**（MA 插件可直接读），
+  即把 ② 的 TARGET 指向 HA 的 media 共享，或把同步脚本放到 HA 上跑；
+- MA 的 Filesystem 提供方也支持 **SMB/NFS 路径**，但那就等于让 MA 跨海读东京的文件——能通但慢，
+  不如在本机留一份。
+
+### 注意事项（不隐瞒）
+
+- 曲库 = **我们播放过的整曲**，不是全网曲库。新歌要先播过一次才会进曲库（这恰好也是"听过的都在本地"）。
+- 要"按歌单/专辑批量拉整张"是另一件事（需要一个批量导出任务：遍历歌单 → 逐首落盘 → 重建曲库）。
+- 标签是写进文件里的，之后任何支持读标签的播放器（Plex/Jellyfin/Navidrome/MA）都能正确认歌。
+
 ## 2. 语音助手（可选）
 
 如果 HA 接了 Assist / 小爱 / HomePod，可用一个 `input_text` + 上面的脚本实现「说一句就放歌」。
