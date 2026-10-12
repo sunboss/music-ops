@@ -68,6 +68,10 @@ GO_ADAPTER_FALLBACK = os.getenv("GO_ADAPTER_FALLBACK", "")
 # 平台能不能用要用真实歌曲实测，不看文档承诺。
 DEFAULT_SOURCES = "kuwo,kugou,qq,netease,qianqian,bilibili,joox,soda,fivesing,jamendo"
 FALLBACK_SOURCES = os.getenv("FALLBACK_SOURCES", DEFAULT_SOURCES)
+# 音质偏好：lossless（默认，最高可用音质）| speed（挑最小体积候选，约 320k，快起播省流量）
+PREFER_QUALITY = os.getenv("PREFER_QUALITY", "lossless").strip().lower()
+if PREFER_QUALITY not in ("lossless", "speed"):
+    PREFER_QUALITY = "lossless"
 
 # 网易云直链（NetEase 系统）默认不参与取音源（ADR-1：音源以自有 Go 引擎为主力）。
 # 需要临时开回最后手段时置 ALLOW_OFFICIAL=1，不必改代码。
@@ -305,10 +309,13 @@ def go_call(path, timeout=60):
     raise last if last else RuntimeError("no go adapter configured")
 
 
-def go_resolve(name, artist, album, dur):
-    """调用 Go 适配器做严格匹配换源；无匹配返回 None"""
+def go_resolve(name, artist, album, dur, prefer=None):
+    """调用 Go 适配器做严格匹配换源；无匹配返回 None。
+    音质偏好（lossless|speed）随请求透传——speed 模式 Go 侧
+    会在严格匹配候选中挑体积最小者（约 320k），省流量快起播。"""
     q = urllib.parse.urlencode({"name": name, "artist": artist, "album": album,
-                                "duration": str(dur or 0), "sources": FALLBACK_SOURCES})
+                                "duration": str(dur or 0), "sources": FALLBACK_SOURCES,
+                                "prefer": prefer or PREFER_QUALITY})
     try:
         return go_call("/resolve-best?" + q, timeout=25)
     except urllib.error.HTTPError as e:
@@ -1868,6 +1875,10 @@ class H(BaseHTTPRequestHandler):
         prm = urllib.parse.parse_qs(query or "")
         sid = (prm.get("id", [""])[0].split(",")[0] or "").strip()
         print("[Enhancer] 取源请求 id=%s UA=%s" % (sid, (self.headers.get("User-Agent") or "")[:40]))
+        # 每次请求可带 prefer=lossless|speed 覆盖服务端默认（前端设置页选择）
+        prefer = (prm.get("prefer", [""])[0] or "").strip().lower()
+        if prefer not in ("lossless", "speed"):
+            prefer = PREFER_QUALITY
 
         if sid:
             hit = cache_get(sid)
@@ -1910,8 +1921,8 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 print("[Enhancer] 官方条目构造失败: %s" % e)
 
-        # 官方不可用 → 严格匹配换源
-        res = go_resolve(name, artist, album, dur)
+        # 官方不可用 → 严格匹配换源（prefer 音质偏好透传）
+        res = go_resolve(name, artist, album, dur, prefer)
         if not res or not is_http(res.get("url")):
             # 最后试网易云外链：体积够长才采纳（VIP 曲它只给 30 秒）
             osz = measure_size(NETEASE_OUTER + urllib.parse.quote(sid))

@@ -20,7 +20,8 @@ export const api = {
   },
 
   async songUrl(id: number | string): Promise<SongUrlItem | null> {
-    const { data } = await http.get("/song/url", { params: { id } });
+    const prefer = localStorage.getItem("rm-quality") || "lossless";
+    const { data } = await http.get("/song/url", { params: { id, prefer } });
     return (data.data || [])[0] || null;
   },
 

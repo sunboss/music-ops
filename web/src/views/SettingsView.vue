@@ -46,6 +46,18 @@ const THEMES = [
   { key: "system", label: "跟随系统", icon: MonitorSmartphone },
 ];
 
+// 音质偏好：存本机 localStorage，点播请求带 prefer 参数给换源引擎
+const QUALITIES = [
+  { key: "lossless", label: "无损" },
+  { key: "speed", label: "极速 320k" },
+];
+const quality = ref(localStorage.getItem("rm-quality") || "lossless");
+function saveQuality() {
+  localStorage.setItem("rm-quality", quality.value);
+  saved.value = true;
+  window.setTimeout(() => { saved.value = false; }, 1200);
+}
+
 function applyTheme() {
   localStorage.setItem("theme", theme.value);
   const dark = theme.value === "dark" ||
@@ -95,6 +107,17 @@ onMounted(async () => {
                @input="p.setVolume(Number(($event.target as HTMLInputElement).value))" />
         <b class="tnum">{{ Math.round(p.volume * 100) }}%</b>
       </div>
+      <div class="row">
+        <span>音质</span>
+        <div class="themes">
+          <button v-for="q in QUALITIES" :key="q.key" :class="{ on: quality === q.key }"
+                  @click="quality = q.key; saveQuality()">
+            <span>{{ q.label }}</span>
+            <Check v-if="quality === q.key" :size="14" class="ck" />
+          </button>
+        </div>
+      </div>
+      <p class="note">无损：换源引擎按原样返回最高匹配；极速：在匹配候选中挑体积最小的（约 128–320k），起播更快、更省流量。对新点播的歌即时生效。</p>
     </section>
 
     <section class="grp">

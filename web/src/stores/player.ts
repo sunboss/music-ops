@@ -161,7 +161,7 @@ export const usePlayerStore = defineStore("player", {
 
       if (remoteSupported()) {
         // Chromium：remote.prompt 有时既不成功也不报错，加超时兜底，不让按钮像坏了
-        const r = startCast(url, hooks);
+        const r = Promise.resolve(startCast(url, hooks));
         const done = await Promise.race([
           r.then(() => "ok").catch(() => "err"),
           new Promise((res) => window.setTimeout(() => res("hang"), 3000)),

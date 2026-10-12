@@ -15,7 +15,7 @@ const pct = computed(() => (p.duration ? Math.min(100, (p.progress / p.duration)
 const artist = computed(() => (p.current?.ar || []).map((a) => a.name).join(", "));
 
 const liked = vueComputed(() => isFav(p.current?.id));
-function like() { toggleFav(p.current); }
+function like() { toggleFav(p.current ?? undefined); }
 
 function seek(e: MouseEvent) {
   const el = e.currentTarget as HTMLElement;

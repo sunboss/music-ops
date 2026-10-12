@@ -34,7 +34,7 @@ async function runDiag() {
 }
 const syncLiked = () => { liked.value = isFav(p.current?.id); };
 watch(() => p.current?.id, syncLiked, { immediate: true });
-function like() { liked.value = toggleFav(p.current); }
+function like() { liked.value = toggleFav(p.current ?? undefined); }
 const lyricBox = ref<HTMLElement | null>(null);
 
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;

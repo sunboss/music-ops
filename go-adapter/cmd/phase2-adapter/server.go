@@ -279,6 +279,11 @@ func handleResolveBest(w http.ResponseWriter, r *http.Request) {
 		}
 		var picked *model.Song
 		rejected := 0
+		// prefer=speed：在全部严格匹配候选里挑体积最小的（约 320k 或更低），
+		// 而不是第一个——省流量、快起播；默认 lossless 保持原行为（第一个匹配，
+		// 上游 kuwo 本身从 2000kflac 往下试，天然最高音质优先）。
+		preferSpeed := r.URL.Query().Get("prefer") == "speed"
+		var bestSize int64
 		for i := range songs {
 			g := songs[i]
 			if g.IsInvalid || g.IsVIP {
@@ -286,6 +291,13 @@ func handleResolveBest(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if match(want, g) == "" {
+				if preferSpeed {
+					if picked == nil || (g.Size > 0 && (bestSize <= 0 || g.Size < bestSize)) {
+						picked = &g
+						bestSize = g.Size
+					}
+					continue
+				}
 				picked = &g
 				break
 			}
