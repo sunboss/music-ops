@@ -26,6 +26,9 @@ export const usePlayerStore = defineStore("player", {
     volume: Number(localStorage.getItem("volume") ?? 1),
     error: "",
     showFull: false,
+    showQueue: false,         // 播放队列抽屉
+    autoContinue: localStorage.getItem("autoContinue") !== "0",   // 无限电台：队列快空时 AI 自动续歌
+    continuing: false,
     lyrics: [] as LyricLine[],
     lyricFor: -1,
     ready: false,
@@ -94,6 +97,35 @@ export const usePlayerStore = defineStore("player", {
       } catch { /* 部分浏览器不支持完整 metadata，忽略 */ }
     },
 
+    /** 把 AI 续播的歌接到队列尾部（不打断当前播放） */
+    appendQueue(songs: Song[]) {
+      const have = new Set(this.queue.map((s) => String(s.id)));
+      const fresh = songs.filter((s) => s.id && !have.has(String(s.id)));
+      if (fresh.length) this.queue = [...this.queue, ...fresh];
+      return fresh.length;
+    },
+
+    setAutoContinue(on: boolean) {
+      this.autoContinue = on;
+      localStorage.setItem("autoContinue", on ? "1" : "0");
+    },
+
+    /** 无限电台：队列快空时请 AI 基于当前曲目续一批（去重、跳过已听、跳过无音源） */
+    async continueWithAI() {
+      if (this.continuing || !this.autoContinue) return 0;
+      const seed = this.current;
+      if (!seed) return 0;
+      this.continuing = true;
+      try {
+        const exclude = this.queue.slice(Math.max(0, this.index - 12), this.index + 1).map((s) => s.id);
+        const r = await api.aiContinue(seed.id, 6, exclude);
+        if (r.error || !r.songs?.length) return 0;
+        const n = this.appendQueue(r.songs);
+        if (n) console.info("[R-Music] AI 续播 +%d 首：%s", n, r.title || "");
+        return n;
+      } catch { return 0; } finally { this.continuing = false; }
+    },
+
     playQueue(songs: Song[], index = 0) {
       if (!songs.length) return;
       this.queue = songs.slice();
@@ -129,6 +161,8 @@ export const usePlayerStore = defineStore("player", {
         }
         song.playable = true;
         pushHistory(song);                       // 本地播放历史（音乐库/离线可见）
+        // 队列快见底就提前续，保证交接时不空档
+        if (this.queue.length - i - 1 <= 2) void this.continueWithAI();
         this.duration = Math.round((song.dt || 0) / 1000);
         el.src = item.url;
         playStart = Date.now();
@@ -149,6 +183,13 @@ export const usePlayerStore = defineStore("player", {
 
     next(fromEnd = false) {
       if (this.index + 1 < this.queue.length) { void this.playAt(this.index + 1); return; }
+      // 队列到头：若开了无限电台，先让 AI 续一批再切，避免播放断档
+      if (this.autoContinue) {
+        void this.continueWithAI().then((n) => {
+          if (n > 0 && this.index + 1 < this.queue.length) void this.playAt(this.index + 1);
+        });
+        return;
+      }
       el.pause(); this.progress = 0;
       if (!fromEnd && this.queue.length) void this.playAt(0);
       else this.playing = false;

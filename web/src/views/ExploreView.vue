@@ -44,6 +44,12 @@ function pick(c: string) { cat.value = c; void loadCat(c); }
       <p>排行榜、分类歌单与新碟</p>
     </header>
 
+    <div class="fm" @click="router.push('/fm')">
+      <span class="fm-i">📻</span>
+      <div><b>私人 FM</b><span>不喜欢就划走，越听越懂你</span></div>
+      <span class="fm-go">进入 ›</span>
+    </div>
+
     <Section v-if="toplists.length" title="排行榜">
       <CardGrid :items="toplists" :min="150" @open="(id) => router.push(`/playlist/${id}`)" />
     </Section>
@@ -68,9 +74,16 @@ function pick(c: string) { cat.value = c; void loadCat(c); }
 .hero { padding: 22px 22px 2px; }
 .hero h1 { font-size: 27px; font-weight: 700; letter-spacing: -.022em; }
 .hero p { margin: 3px 0 0; font-size: 13px; color: var(--fg2); }
+.fm { display: flex; align-items: center; gap: 12px; margin: 14px 22px 0; padding: 14px 16px;
+       border-radius: 12px; background: var(--acc-weak); cursor: pointer; }
+.fm-i { font-size: 20px; }
+.fm div { flex: 1; min-width: 0; }
+.fm b { display: block; font-size: 14.5px; font-weight: 600; }
+.fm div span { font-size: 12.5px; color: var(--fg2); }
+.fm-go { font-size: 13px; color: var(--acc); }
 .cats { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 14px; }
 .cats button { padding: 5px 13px; border-radius: 15px; background: var(--fill); font-size: 12.5px; color: var(--fg2); }
 .cats button.on { background: var(--acc); color: #fff; font-weight: 600; }
 .tip { padding: 14px 0; color: var(--fg2); font-size: 13px; }
-@media (max-width: 640px) { .hero { padding: 16px 14px 0; } .hero h1 { font-size: 24px; } }
+@media (max-width: 640px) { .hero { padding: 16px 14px 0; } .hero h1 { font-size: 24px; } .fm { margin: 12px 14px 0; } }
 </style>

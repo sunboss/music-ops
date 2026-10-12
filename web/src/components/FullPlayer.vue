@@ -86,7 +86,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
           <Volume2 :size="15" />
           <input class="vol" type="range" min="0" max="1" step="0.01" :value="p.volume"
                  @input="p.setVolume(Number(($event.target as HTMLInputElement).value))" />
-          <button class="ib sm" title="播放队列"><ListMusic :size="17" /></button>
+          <button class="ib sm" title="播放队列" @click="p.showQueue = true"><ListMusic :size="17" /></button>
         </div>
       </footer>
     </div>

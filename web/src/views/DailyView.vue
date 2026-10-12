@@ -35,7 +35,7 @@ const label = computed(() => `${today.getMonth() + 1}月${today.getDate()}日`);
     </div>
     <p v-if="err" class="tip">加载失败：{{ err }}</p>
     <p v-else-if="loading" class="tip">正在为你挑选…</p>
-    <p v-else-if="!songs.length" class="tip">今日推荐尚未生成（需要登录网易云账号后才有数据）</p>
+    <p v-else-if="!songs.length" class="tip">暂时没有推荐数据，稍后重试。</p>
     <div v-else class="list">
       <SongRow v-for="(s, i) in songs" :key="s.id" :song="s" :index="i" class="vrow"
                :active="p.current?.id === s.id" @play="(idx) => p.playQueue(songs, idx)" />

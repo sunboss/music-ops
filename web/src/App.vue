@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { RouterView, useRouter, useRoute } from "vue-router";
-import { Search, Sparkles, House, Compass, Library, ChevronLeft } from "lucide-vue-next";
+import { Search, Sparkles, House, Compass, Library, ChevronLeft, Radio } from "lucide-vue-next";
 import PlayerBar from "@/components/PlayerBar.vue";
 import FullPlayer from "@/components/FullPlayer.vue";
+import QueueDrawer from "@/components/QueueDrawer.vue";
 import MiniPlayer from "@/components/MiniPlayer.vue";
 import TabBar from "@/components/TabBar.vue";
 import { usePlayerStore } from "@/stores/player";
@@ -18,6 +19,7 @@ const navs = [
   { to: "/explore", label: "发现", icon: Compass },
   { to: "/library", label: "音乐库", icon: Library },
   { to: "/ai", label: "AI 音乐", icon: Sparkles },
+  { to: "/fm", label: "私人 FM", icon: Radio },
 ];
 const isActive = (to: string) => (to === "/" ? route.path === "/" : route.path.startsWith(to));
 
@@ -33,6 +35,7 @@ const pageTitle = computed(() => {
   if (p.startsWith("/explore")) return "发现";
   if (p.startsWith("/library")) return "音乐库";
   if (p.startsWith("/ai")) return "AI 音乐";
+  if (p.startsWith("/fm")) return "私人 FM";
   if (p.startsWith("/settings")) return "设置";
   return "";
 });
@@ -55,7 +58,9 @@ function doSearch() {
         <span>{{ n.label }}</span>
       </a>
       <div class="sh">播放队列</div>
-      <div class="qn">{{ p.hasQueue ? `${p.queue.length} 首 · 第 ${p.index + 1} 首` : "空" }}</div>
+      <button class="qn" @click="p.showQueue = true">
+        {{ p.hasQueue ? `${p.queue.length} 首 · 第 ${p.index + 1} 首` : "空" }} ›
+      </button>
     </aside>
 
     <div class="main">
@@ -81,6 +86,8 @@ function doSearch() {
       <PlayerBar class="d-bar" />
       <!-- 全屏播放器（桌面抽屉式 / 移动全屏，含歌词） -->
       <FullPlayer />
+      <!-- 播放队列 -->
+      <QueueDrawer />
       <!-- 移动端：迷你播放条 + 底部 Tab -->
       <div class="m-bottom vibrant">
         <MiniPlayer />
@@ -118,7 +125,8 @@ function doSearch() {
   .nv:hover { background: var(--fill); }
   .nv.on { background: var(--acc-weak); color: var(--acc); font-weight: 500; }
   .sh { font-size: 11px; color: var(--fg3); padding: 18px 10px 5px; letter-spacing: .04em; }
-  .qn { font-size: 12.5px; color: var(--fg2); padding: 0 10px; }
+  .qn { font-size: 12.5px; color: var(--fg2); padding: 2px 10px; text-align: left; border-radius: 6px; }
+  .qn:hover { background: var(--fill); color: var(--fg); }
   .d-bar { display: flex; }
   .m-bottom { display: none; }
   .search { width: 300px; }

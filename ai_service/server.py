@@ -1146,6 +1146,47 @@ def ai_curate(text, songs):
             "songs": ordered + rest, "picked": len(pick)}
 
 
+CONTINUE_PROMPT = (
+    "用户正在连续收听音乐，当前这首是：歌名=%s 歌手=%s 专辑=%s\n"
+    "请给出 6-8 个检索词，用来找**风格/氛围/年代/语种相近、但不重复**的歌，让连续播放不断档。\n"
+    "要求：不要出现当前这首歌自己的名字；可以用同歌手的其他代表作、同风格歌手、"
+    "同年代同语种、同一场景。\n"
+    '只输出 JSON：{"title":"电台名(12字内)","keywords":["检索词",...],"reply":"一句话"}。')
+
+
+def ai_continue_plan(name, artist, album, ctx=""):
+    """让大模型基于当前曲目给出「接着听什么」的检索词"""
+    out = ai_chat([{"role": "user", "content": CONTINUE_PROMPT % (name, artist, album or "")
+                    + (("\n【用户口味】" + ctx) if ctx else "")}], temperature=0.55)
+    plan = json.loads(_strip_fence(out))
+    kws = [str(k) for k in (plan.get("keywords") or []) if str(k).strip()]
+    if not kws:
+        kws = [artist or name]
+    plan["keywords"] = kws[:8]
+    return plan
+
+
+ASK_PROMPT = (
+    "判断用户这句话想让音乐播放器做什么。只输出 JSON（不要解释）：\n"
+    '{"intent":"play|radio|continue|control|unknown",'
+    '"query":"用于检索的词（play/radio 时给）",'
+    '"control":"next|prev|pause|resume|volume_up|volume_down|mute|shuffle",'
+    '"reply":"一句简短中文回复"}\n'
+    "intent 含义：\n"
+    "  play     = 想听具体的歌/歌手/专辑（例如「放周杰伦的晴天」）\n"
+    "  radio    = 想要一类歌单/场景/情绪（例如「深夜写代码听的」）\n"
+    "  continue = 想接着听类似的、换点别的（例如「再来点类似的」）\n"
+    "  control  = 控制正在播放（切歌/暂停/继续/音量/随机）\n"
+    "  unknown  = 无法判断\n"
+    "注意：控制类必须只填 control；不要把它当搜索词。")
+
+
+def ai_ask_plan(text):
+    out = ai_chat([{"role": "user", "content": ASK_PROMPT + "\n用户说：" + text}], temperature=0)
+    v = json.loads(_strip_fence(out))
+    return v if isinstance(v, dict) else {}
+
+
 def rank_songs(songs, plan):
     """按「与需求的吻合度」排序：指定歌手命中优先，其次歌名关键词命中，最后时长较长者"""
     artist = (plan.get("artist") or "").strip().lower()
@@ -1702,8 +1743,90 @@ class H(BaseHTTPRequestHandler):
         return playable[:limit], cand
 
     # ------------------------------------------------------------ AI 电台/歌单
-    def handle_ai_radio(self, text, want=18):
-        """一句话生成整张歌单：多关键词检索 + 探活，只交付能完整播放的"""
+    def _continue_payload(self, query, body=None):
+        """AI 续播（纯函数版，返回 (状态码, 数据)，便于被统一指令复用）"""
+        prm = urllib.parse.parse_qs(query or "")
+        sid = (prm.get("sid", [""])[0] or "").strip()
+        try:
+            want = int(prm.get("want", ["6"])[0])
+        except Exception:
+            want = 6
+        if not ai_enabled():
+            return 503, {"error": "AI 未配置"}
+        name, artist, album, dur = song_detail(sid) if sid else ("", "", "", 0)
+        if not name:
+            return 400, {"error": "缺少有效的 sid（当前曲目 id）"}
+        exclude = set()
+        for x in (prm.get("exclude", [""])[0] or "").split(","):
+            x = x.strip()
+            if x:
+                exclude.add(x)
+        if sid:
+            exclude.add(str(sid))
+        ctx = taste_context()
+        try:
+            plan = ai_continue_plan(name, artist, album, ctx)
+        except Exception as e:
+            print("[Enhancer] AI 续播解析失败: %s" % str(e)[:80])
+            return 502, {"error": "AI 解析失败: %s" % str(e)[:120]}
+        songs, _ = self._ai_collect(plan["keywords"], {"artist": artist}, per_kw=8, limit=want + len(exclude))
+        songs = [s for s in songs if str(s.get("id")) not in exclude][:want]
+        print("[Enhancer] AI 续播 ← 《%s》%s -> %d 首（关键词 %s）"
+              % (name, artist, len(songs), plan["keywords"][:4]))
+        return 200, {"title": plan.get("title") or "继续播放",
+                     "reply": plan.get("reply") or "",
+                     "keywords": plan["keywords"], "songs": songs,
+                     "seed": {"id": sid, "name": name, "artist": artist}}
+
+    def handle_ai_continue(self, query, body=None):
+        return self._json(*self._continue_payload(query, body))
+
+    def handle_ai_ask(self, body):
+        """统一指令入口：一句话判断意图（点歌/电台/续播/控制）并分派"""
+        try:
+            d = json.loads((body or b"{}").decode("utf-8", "ignore")) or {}
+        except Exception:
+            d = {}
+        text = (d.get("q") or "").strip()
+        seed = str(d.get("seed") or "")
+        exclude = ",".join(str(x) for x in (d.get("exclude") or []))
+        if not text:
+            return self._json(400, {"error": "缺少 q"})
+        if not ai_enabled():
+            return self._json(503, {"error": "AI 未配置"})
+        try:
+            plan = ai_ask_plan(text)
+        except Exception as e:
+            return self._json(502, {"error": "AI 解析失败: %s" % str(e)[:120]})
+        intent = (plan.get("intent") or "unknown").lower()
+        reply = str(plan.get("reply") or "")[:80]
+        print("[Enhancer] AI 指令 %r -> intent=%s control=%s"
+              % (text[:24], intent, plan.get("control")))
+        if intent == "control":
+            return self._json(200, {"intent": "control", "control": plan.get("control") or "next",
+                                    "reply": reply})
+        if intent == "continue":
+            q = "sid=%s&want=6&exclude=%s" % (urllib.parse.quote(seed), urllib.parse.quote(exclude))
+            code, payload = self._continue_payload(q)
+            payload["intent"] = "continue"
+            return self._json(code, payload)
+        if intent == "radio":
+            code, payload = self._radio_payload(plan.get("query") or text, 15)
+            payload["intent"] = "radio"
+            return self._json(code, payload)
+        # play / unknown 都按「点歌」走，拿不到歌再退化成电台
+        code, payload = self._query_payload("q=" + urllib.parse.quote(plan.get("query") or text))
+        if not payload.get("songs"):
+            code2, payload2 = self._radio_payload(plan.get("query") or text, 12)
+            payload2["intent"] = "radio"
+            return self._json(code2, payload2)
+        payload["intent"] = "play"
+        if reply and not payload.get("reply"):
+            payload["reply"] = reply
+        return self._json(code, payload)
+
+    def _radio_payload(self, text, want=18):
+        """一句话生成整张歌单（纯函数版，返回 (状态码, 数据)）"""
         ctx = taste_context()
         if ctx:
             print("[Enhancer] 带入口味上下文: %s" % ctx[:140])
@@ -1713,7 +1836,7 @@ class H(BaseHTTPRequestHandler):
             plan = ai_radio_plan(ask)
         except Exception as e:
             print("[Enhancer] AI 电台解析失败: %s" % e)
-            return self._json(502, {"error": "AI 解析失败: %s" % str(e)[:160]})
+            return 502, {"error": "AI 解析失败: %s" % str(e)[:160]}
         songs, _ = self._ai_collect(plan["keywords"], plan, per_kw=8, limit=want)
         if len(songs) < min(8, want):
             # 不够就再要一轮关键词（最多补一次，避免无限循环）
@@ -1736,14 +1859,17 @@ class H(BaseHTTPRequestHandler):
         songs = songs[:want]
         print("[Enhancer] AI 电台 %r -> %d 首可播（关键词 %d 个，策展=%s）"
               % (text[:24], len(songs), len(plan["keywords"]), bool(cur)))
-        return self._json(200, {"title": title, "reply": reply,
-                                "curated": bool(cur), "picked": (cur or {}).get("picked"),
-                                "plan": {"keywords": plan["keywords"]},
-                                "songs": songs, "playable_count": len(songs)})
+        return 200, {"title": title, "reply": reply,
+                     "curated": bool(cur), "picked": (cur or {}).get("picked"),
+                     "plan": {"keywords": plan["keywords"]},
+                     "songs": songs, "playable_count": len(songs)}
+
+    def handle_ai_radio(self, text, want=18):
+        return self._json(*self._radio_payload(text, want))
 
     # ------------------------------------------------------------ AI 点歌
-    def handle_ai_query(self, query, body=None):
-        """自然语言点歌：大模型把一句话变成检索条件 -> 官方搜索 -> 返回可点播的歌曲列表"""
+    def _query_payload(self, query, body=None):
+        """自然语言点歌（纯函数版，返回 (状态码, 数据)）"""
         text = ""
         want = 0
         if body:
@@ -1759,10 +1885,10 @@ class H(BaseHTTPRequestHandler):
             text = (prm.get("q", [""])[0] or "").strip()
         text = (text or "").strip()
         if not text:
-            return self._json(400, {"error": "缺少 q 参数"})
+            return 400, {"error": "缺少 q 参数"}
         if not ai_enabled():
-            return self._json(503, {"error": "AI 未配置：请在服务端设置 AI_API_KEY（大模型网关 token）",
-                                    "gateway": AI_GATEWAY, "model": AI_MODEL})
+            return 503, {"error": "AI 未配置：请在服务端设置 AI_API_KEY（大模型 gateway token）",
+                         "gateway": AI_GATEWAY, "model": AI_MODEL}
         if want:
             return self.handle_ai_radio(text, min(30, max(5, want)))
         _t = taste_context()
@@ -1770,7 +1896,7 @@ class H(BaseHTTPRequestHandler):
             plan = ai_plan(text + (("\n【用户口味参考】" + _t) if _t else ""))
         except Exception as e:
             print("[Enhancer] AI 解析失败: %s" % e)
-            return self._json(502, {"error": "AI 解析失败: %s" % str(e)[:160]})
+            return 502, {"error": "AI 解析失败: %s" % str(e)[:160]}
 
         # 多关键词取候选 -> 按吻合度排序 -> 并发探活 -> 只交付能完整播放的
         cand, seen = [], set()
@@ -1799,8 +1925,11 @@ class H(BaseHTTPRequestHandler):
             reply += "（%d 首可完整播放）" % len(playable)
         else:
             reply += "（这些暂时只有试听片段，可能无法完整播放）"
-        return self._json(200, {"reply": reply, "plan": plan, "songs": songs,
-                                "playable_count": len(playable)})
+        return 200, {"reply": reply, "plan": plan, "songs": songs,
+                     "playable_count": len(playable)}
+
+    def handle_ai_query(self, query, body=None):
+        return self._json(*self._query_payload(query, body))
 
     # ------------------------------------------------------------ 单曲诊断
     def handle_debug_song(self, query):
@@ -2122,6 +2251,8 @@ class H(BaseHTTPRequestHandler):
             return self.handle_debug_song(p.query)
         if real == "/ai/query":
             return self.handle_ai_query(p.query)
+        if real == "/ai/continue":
+            return self.handle_ai_continue(p.query)
         if real == "/ai/radio":
             qs = urllib.parse.parse_qs(p.query or "")
             q = (qs.get("q", [""])[0] or "").strip()
@@ -2140,6 +2271,13 @@ class H(BaseHTTPRequestHandler):
         if real == "/ai/query":
             ln = int(self.headers.get("Content-Length", 0) or 0)
             return self.handle_ai_query(p.query, self.rfile.read(ln) if ln else b"")
+        if real == "/ai/continue":
+            ln = int(self.headers.get("Content-Length", 0) or 0)
+            return self.handle_ai_continue(p.query, self.rfile.read(ln) if ln else b"")
+        if real == "/ai/ask":
+            # 统一指令入口：一句话判断意图（点歌/电台/续播/控制）
+            ln = int(self.headers.get("Content-Length", 0) or 0)
+            return self.handle_ai_ask(self.rfile.read(ln) if ln else b"{}")
         if real == "/ai/radio":
             ln = int(self.headers.get("Content-Length", 0) or 0)
             try:

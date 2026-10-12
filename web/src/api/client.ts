@@ -86,6 +86,12 @@ export const api = {
     return (data.playlists || []) as Playlist[];
   },
 
+  /** 匿名可用的歌单列表（接口默认账号） */
+  async userPlaylists() {
+    const { data } = await http.get("/user/playlist", { params: { uid: 32953014, limit: 30 } });
+    return (data.playlist || []) as { id: number; name: string; coverImgUrl: string; trackCount?: number }[];
+  },
+
   async dailySongs(): Promise<Song[]> {
     const { data } = await http.get("/recommend/songs");
     return data?.data?.dailySongs || [];
@@ -100,6 +106,24 @@ export const api = {
   async aiQuery(q: string, count = 5) {
     const { data } = await http.post("/ai/query", { q, count });
     return data as { reply: string; songs: Song[]; playable_count?: number; error?: string };
+  },
+
+  /** AI：无缝续播（基于当前曲目接着推） */
+  async aiContinue(seedId: number | string, want = 6, exclude: (number | string)[] = []) {
+    const { data } = await http.get("/ai/continue", {
+      params: { sid: seedId, want, exclude: exclude.join(",") },
+    });
+    return data as { title: string; reply: string; songs: Song[]; error?: string };
+  },
+
+  /** AI：统一指令入口——一句话判断意图（点歌/电台/续播/控制） */
+  async aiAsk(q: string, seed?: number | string, exclude: (number | string)[] = []) {
+    const { data } = await http.post("/ai/ask", { q, seed: seed ? String(seed) : "", exclude });
+    return data as {
+      intent: "play" | "radio" | "continue" | "control" | "unknown";
+      control?: string; reply?: string; title?: string; songs?: Song[];
+      playable_count?: number; error?: string;
+    };
   },
 
   /** AI：一句话生成电台/歌单 */
