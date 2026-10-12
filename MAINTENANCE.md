@@ -16,6 +16,31 @@
 - 容器：`music-web` / `music-enhancer` / `music-go-adapter` / `music-api`
 - 换源适配器与网易云 API **都不对外发布端口**，只走内部网络
 
+## AI 能力（大模型直连 DeepSeek 官方）
+
+```
+AI_GATEWAY=https://api.deepseek.com/v1     # 直连官方，不经中转网关（网关会按负载对单模型 503）
+AI_MODEL=deepseek-chat
+AI_MODEL_FALLBACKS=deepseek-reasoner       # 单模型不可用时自动降级
+```
+
+密钥只存服务器 `data/ai_key.txt`（600），旧网关密钥备份在 `data/ai_key_gateway.txt`。
+容器通过 `AI_API_KEY_FILE` 读取，**不进代码、不进日志、不进仓库**。
+
+大模型承担的是**规则做不到**的四件事：
+
+| 能力 | 位置 | 说明 |
+|---|---|---|
+| 跨平台候选终审 | `ai_arbitrate` | 把各平台原始候选交给模型判断「是否同一录音同一版本」。规则做不到跨语言/别名：晴天+Jay Chou → 周杰伦 |
+| 检索变体生成 | `ai_search_variants` | 歌名带括号补充、歌手写法怪时给出更有效的检索写法 |
+| 电台策展 | `ai_curate` | 对**真实可播歌单**取舍排序命名，规则判断不了「像不像这个场景」 |
+| 搜索词归属 | `_bg_search_artist` | 搜单首歌名时后台判断「这是谁的歌」，结果缓存 30 天 |
+
+双保险始终生效：时长差 >35 秒、候选带目标没有的版本标记（Live/Remix/伴奏/DJ版…），一律拒绝。
+
+> 注意：网易云对**未登录请求系统性压制部分曲库**（如周杰伦：搜索/歌手热门/专辑三路都查不到，
+> 但按 ID 直查正常）。这类原唱只能靠 ID 命中，无法通过搜索找回。
+
 ## ⚠️ 关键依赖：国内取链
 
 **适配器跑在国内机**（`111.228.4.117`，systemd `r-music-adapter.service`，监听 `127.0.0.1:8811`），

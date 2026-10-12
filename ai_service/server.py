@@ -32,6 +32,7 @@ PORT = int(os.getenv("PORT", "3001"))
 # ---------------------------------------------------------------- AI 网关
 # 大模型网关（OpenAI 兼容）。密钥只从环境变量读，绝不写进代码或日志。
 AI_GATEWAY = os.getenv("AI_GATEWAY", "https://api.1234r.com/v1")
+AI_MODEL_FALLBACKS = os.getenv("AI_MODEL_FALLBACKS", "")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
 
 
@@ -279,24 +280,69 @@ def ai_enabled():
     return bool(AI_API_KEY.strip())
 
 
+_ai_model_state = {"model": "", "until": 0.0}
+
+
+def ai_models():
+    """可用模型顺序：主模型 + 备用模型（网关单模型可能因负载 503，必须能自动换）"""
+    primary = [AI_MODEL] + [m.strip() for m in AI_MODEL_FALLBACKS.split(",")]
+    out = []
+    # 最近成功过的模型优先，避免每次都去撞那个正在过载的
+    st = _ai_model_state
+    if st["model"] and time.time() < st["until"] and st["model"] in primary:
+        out.append(st["model"])
+    for m in primary:
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
 def ai_chat(messages, timeout=40, temperature=0.3, json_mode=True):
-    """调用大模型网关；返回助手回复文本。失败抛出异常（由调用方明确报错）"""
+    """调用大模型网关；返回助手回复文本。
+    失败时依次尝试备用模型（网关会因单模型负载返回 503），全部失败才抛异常。"""
     if not ai_enabled():
         raise RuntimeError("未配置 AI_API_KEY")
-    body = {"model": AI_MODEL, "messages": messages, "temperature": temperature}
-    if json_mode:
-        body["response_format"] = {"type": "json_object"}
-    req = urllib.request.Request(
-        AI_GATEWAY.rstrip("/") + "/chat/completions",
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json",
-                 # 网关前置了 Cloudflare，缺少浏览器形态的 UA 会被 403 拦掉
-                 "User-Agent": UA_BROWSER,
-                 "Accept": "application/json",
-                 "Authorization": "Bearer " + AI_API_KEY.strip()})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        d = json.loads(r.read().decode("utf-8"))
-    return (d.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    last = None
+    for model in ai_models():
+        body = {"model": model, "messages": messages, "temperature": temperature}
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        req = urllib.request.Request(
+            AI_GATEWAY.rstrip("/") + "/chat/completions",
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     # 网关前置了 Cloudflare，缺少浏览器形态的 UA 会被 403 拦掉
+                     "User-Agent": UA_BROWSER,
+                     "Accept": "application/json",
+                     "Authorization": "Bearer " + AI_API_KEY.strip()})
+        for attempt in (1, 2):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    d = json.loads(r.read().decode("utf-8"))
+                txt = (d.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                if not isinstance(txt, str) or not txt.strip():
+                    raise ValueError("空回复")
+                if model != AI_MODEL:
+                    print("[Enhancer] 模型降级生效：%s 不可用，改用 %s" % (AI_MODEL, model))
+                _ai_model_state.update(model=model, until=time.time() + 300)
+                return txt
+            except urllib.error.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", "ignore")[:150]
+                except Exception:
+                    pass
+                last = "HTTP %s %s" % (e.code, detail)
+                if e.code in (408, 429, 500, 502, 503, 504) and attempt == 1:
+                    time.sleep(1.5)          # 过载/限流：稍等重试同一模型
+                    continue
+                print("[Enhancer] 模型 %s 不可用：%s → 换下一个" % (model, last[:110]))
+                break
+            except Exception as e:
+                last = str(e)[:120]
+                print("[Enhancer] 模型 %s 调用异常：%s → 换下一个" % (model, last))
+                break
+    raise RuntimeError("所有模型均不可用：%s" % last)
 
 
 PLAN_PROMPT = (
@@ -305,6 +351,107 @@ PLAN_PROMPT = (
     '"mood":"情绪或场景，没有则空串","count":5,"reply":"一句简短中文回复"}\n'
     "要求：keywords 用具体可检索的歌名/歌手/主题词，2-3 个，不要整句话；"
     "count 取 3-10；reply 用用户的语言回答。")
+
+
+SEARCH_ARTIST_PROMPT = (
+    "用户在音乐平台只搜了一个词：「%s」。\n"
+    "如果这是某首歌的歌名，请给出这首歌**最著名/原唱**的歌手名；\n"
+    "如果它本身是歌手名、风格词或专辑名，artist 留空。\n"
+    '只输出 JSON：{"song":"歌名","artist":"歌手名","reason":"一句理由"}。\n'
+    "拿不准就把 artist 留空——宁可空也不能给错人。")
+
+
+def upstream_cloudsearch(keyword, limit):
+    """直接向上游搜歌，返回原始歌曲对象（字段与前端一致）"""
+    u = MUSIC_API_UPSTREAM.rstrip("/") + "/cloudsearch?" + urllib.parse.urlencode(
+        {"keywords": keyword, "type": 1, "limit": limit})
+    try:
+        req = urllib.request.Request(u, headers={"User-Agent": UA_BROWSER,
+                                                "Referer": "https://music.1234r.com/"})
+        d = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        return ((d.get("result") or {}).get("songs") or [])
+    except Exception as e:
+        print("[Enhancer] 补搜失败 %r: %s" % (keyword, str(e)[:60]))
+        return []
+
+
+def search_artist_cached(q):
+    """查「这个词最可能是谁的歌」的缓存（30 天）"""
+    try:
+        c = sqlite3.connect(CACHE_DB)
+        c.execute("CREATE TABLE IF NOT EXISTS search_artist (q TEXT PRIMARY KEY, "
+                  "artist TEXT, song TEXT, until REAL)")
+        row = c.execute("SELECT artist, song, until FROM search_artist WHERE q=?",
+                        (q,)).fetchone()
+        c.close()
+        if row and row[2] and time.time() < row[2]:
+            return {"artist": row[0] or "", "song": row[1] or ""}
+    except Exception:
+        pass
+    return None
+
+
+def search_artist_save(q, artist, song):
+    try:
+        c = sqlite3.connect(CACHE_DB)
+        c.execute("CREATE TABLE IF NOT EXISTS search_artist (q TEXT PRIMARY KEY, "
+                  "artist TEXT, song TEXT, until REAL)")
+        # 有结果缓存 30 天；没结果 7 天后再问一次
+        ttl = 2592000 if artist else 604800
+        c.execute("INSERT OR REPLACE INTO search_artist VALUES (?,?,?,?)",
+                  (q, artist or "", song or "", time.time() + ttl))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+def _bg_search_artist(q):
+    """后台问大模型「这个词是谁的歌」，结果进缓存，下次搜索直接用（不拖慢当次搜索）"""
+    try:
+        out = ai_chat([{"role": "user", "content": SEARCH_ARTIST_PROMPT % q}], temperature=0)
+        v = json.loads(_strip_fence(out))
+        a = str(v.get("artist") or "").strip()
+        # 歌手名里带解释性文字的丢掉
+        if len(a) > 20 or "：" in a or ":" in a:
+            a = ""
+        search_artist_save(q, a, str(v.get("song") or "").strip())
+        print("[Enhancer] 搜索词归属: %r -> 歌手=%s（%s）" % (q, a or "无", str(v.get("reason"))[:40]))
+    except Exception as e:
+        print("[Enhancer] 搜索词归属判定失败 %r: %s" % (q, str(e)[:60]))
+
+
+def merge_origin_first(extra, base, total):
+    """把补搜到的「原唱同名曲」放到最前面，其余保持原顺序，按 id 去重"""
+    seen, out = set(), []
+    for s in (extra or []) + (base or []):
+        sid = str((s or {}).get("id") or "")
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        out.append(s)
+    return out[:total] if total else out
+
+
+def _same_title_artist(s, title, artist):
+    """这首歌是否就是「目标歌手的同名曲」"""
+    if _norm_loose((s or {}).get("name")) != _norm_loose(title):
+        return False
+    ar = " ".join(a.get("name", "") for a in ((s or {}).get("ar") or []))
+    na, nar = _norm_loose(artist), _norm_loose(ar)
+    return bool(na and nar and (na in nar or nar in na))
+
+
+def _has_artist_title(songs, title, artist):
+    """列表里是否已经有「这个歌手的这首同名曲」"""
+    nt, na = _norm_loose(title), _norm_loose(artist)
+    for s in (songs or []):
+        if _norm_loose((s or {}).get("name")) != nt:
+            continue
+        ar = " ".join(a.get("name", "") for a in ((s or {}).get("ar") or []))
+        if na and _norm_loose(ar) and (na in _norm_loose(ar) or _norm_loose(ar) in na):
+            return True
+    return False
 
 
 def _strip_fence(s):
@@ -446,6 +593,119 @@ BAD_NAME_HINTS = ("翻唱", "cover", "伴奏", "remix", "dj版", "dj弹鼓", "�
 def bad_variant(name):
     n = (name or "").lower()
     return any(h in n for h in BAD_NAME_HINTS)
+
+
+_prewarm_lock = threading.Lock()
+_prewarming = set()
+_prewarm_stamps = []
+
+PREWARM_PER_LIST = 2            # 每个列表最多预热几首（每首个 ~4MB，别浪费带宽）
+PREWARM_WINDOW = 600            # 10 分钟窗口内最多预热次数
+PREWARM_MAX = 12
+
+
+def _prewarm_allowed():
+    now = time.time()
+    with _prewarm_lock:
+        while _prewarm_stamps and now - _prewarm_stamps[0] > PREWARM_WINDOW:
+            _prewarm_stamps.pop(0)
+        return len(_prewarm_stamps) < PREWARM_MAX
+
+
+# 允许的来路（防外站把我们的音频代理当免费 CDN）
+ALLOWED_REFERERS = tuple(x for x in os.getenv(
+    "ALLOWED_REFERERS", "music.1234r.com,64.83.34.204,localhost,127.0.0.1").split(",") if x.strip())
+
+
+def load_internal_token():
+    try:
+        with open(os.path.join(DATA_DIR, "internal_token.txt")) as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _private_ip(ip):
+    ip = (ip or "").strip()
+    if not ip:
+        return False
+    return (ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172.16.")
+            or ip.startswith("172.17.") or ip.startswith("172.18.") or ip.startswith("172.19.")
+            or ip.startswith("127.") or ip.startswith("::1") or ip == "172.20.0.1")
+
+
+def referer_allowed(handler):
+    """带 Referer 但不是我们自己站点的 → 拒绝；没带 Referer 的放行（自家播放器/诊断工具）"""
+    ref = handler.headers.get("Referer") or handler.headers.get("Origin") or ""
+    if not ref:
+        return True
+    try:
+        host = urllib.parse.urlparse(ref).hostname or ""
+    except Exception:
+        return True
+    if not host:
+        return True
+    return any(a.strip() and a.strip() in host for a in ALLOWED_REFERERS)
+
+
+def prewarm_song(sid):
+    """后台把一首歌解析并落盘，让用户点下去几乎立刻能响"""
+    sid = str(sid or "").strip()
+    if not sid or audio_cached(sid) or is_unplayable(sid):
+        return
+    if not _prewarm_allowed():
+        return
+    with _prewarm_lock:
+        if sid in _prewarming:
+            return
+        _prewarming.add(sid)
+        _prewarm_stamps.append(time.time())
+
+    def work():
+        try:
+            name, artist, album, dur = song_detail(sid)
+            if not name:
+                return
+            cands = []
+            off, _sz = official_url(sid)
+            if is_http(off):
+                cands.append(off)
+            res = go_resolve(name, artist, album, dur)
+            if is_http((res or {}).get("url")):
+                cands.append(res["url"])
+            for c in cands:
+                lp, why = fetch_to_disk(sid, c, dur)
+                if lp:
+                    build_entry(sid, c, dur, "prewarm")
+                    print("[Enhancer] 预热完成 %s (%s)" % (sid, name))
+                    return
+            print("[Enhancer] 预热未成功 %s (%s)" % (sid, name))
+        except Exception as e:
+            print("[Enhancer] 预热异常 %s: %s" % (sid, str(e)[:60]))
+        finally:
+            with _prewarm_lock:
+                _prewarming.discard(sid)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def collect_song_ids(node, limit, out=None):
+    """从上游返回里挑出歌曲 id（用于列表预热）"""
+    if out is None:
+        out = []
+    if len(out) >= limit:
+        return out
+    if isinstance(node, list):
+        for x in node:
+            collect_song_ids(x, limit, out)
+    elif isinstance(node, dict):
+        if node.get("id") and (node.get("ar") or node.get("al")) and node.get("name"):
+            out.append(str(node["id"]))
+            if len(out) >= limit:
+                return out
+        for v in node.values():
+            collect_song_ids(v, limit, out)
+    return out[:limit]
 
 
 def reorder_search_songs(songs):
@@ -1294,7 +1554,14 @@ class H(BaseHTTPRequestHandler):
     # ------------------------------------------------------------ 单曲诊断
     def handle_debug_song(self, query):
         """排查用：说明某首歌会被怎么处理、最终音频真实多长。
-        例：/api/debug/song?id=4872687"""
+        例：/api/debug/song?id=4872687
+        会暴露内部落盘信息，因此仅限内网来源或带内部令牌访问。"""
+        tok = load_internal_token()
+        given = (self.headers.get("X-RM-Token") or "").strip()
+        fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        client = fwd or (self.headers.get("X-Real-IP") or "").strip() or self.client_address[0]
+        if not (tok and given and given == tok) and not _private_ip(client):
+            return self._json(403, {"error": "该接口仅限内网或带内部令牌访问"})
         prm = urllib.parse.parse_qs(query or "")
         sid = (prm.get("id", [""])[0] or "").strip()
         if not sid:
@@ -1378,6 +1645,16 @@ class H(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ 音频代理
     def handle_audio_proxy(self, query):
+        # 防盗链：外站把自己的页面挂上我们的音频地址会被这里挡住
+        if not referer_allowed(self):
+            ref = self.headers.get("Referer") or self.headers.get("Origin") or "-"
+            print("[Enhancer] 拒绝盗链播放 id=%s Referer=%s"
+                  % (urllib.parse.parse_qs(query or "").get("id", [""])[0], ref[:80]))
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self._cors()
+            self.end_headers()
+            return
         prm = urllib.parse.parse_qs(query or "")
         sid = (prm.get("id", [""])[0] or "").strip()
         if not sid:
@@ -1537,7 +1814,28 @@ class H(BaseHTTPRequestHandler):
             if path in ("/search", "/cloudsearch"):
                 res = data.get("result")
                 if isinstance(res, dict) and isinstance(res.get("songs"), list):
+                    kw = (urllib.parse.parse_qs(query or "").get("keywords", [""])[0] or "").strip()
+                    total = len(res["songs"])
+                    # 用户只搜了一个歌名（没带歌手）时，用大模型判断「这是谁的歌」，
+                    # 再把原唱捞回来放前面——平台自身的排序常把原唱压在翻唱后面甚至挤掉
+                    if kw and " " not in kw and len(kw) <= 12:
+                        ent = search_artist_cached(kw)
+                        if ent is None:
+                            threading.Thread(target=_bg_search_artist, args=(kw,), daemon=True).start()
+                        elif ent.get("artist") and not _has_artist_title(res["songs"], kw, ent["artist"]):
+                            extra = upstream_cloudsearch(ent["artist"] + " " + kw,
+                                                         max(8, min(total, 30)))
+                            # 只有补搜里**真的出现该歌手的同名原唱**才动列表，否则保持原样
+                            hit = [s for s in extra if _same_title_artist(s, kw, ent["artist"])]
+                            if hit:
+                                res["songs"] = merge_origin_first(hit, res["songs"], total)
+                                print("[Enhancer] 搜索补回原唱: %r + %s -> %d 首（列表 %d 首）"
+                                      % (kw, ent["artist"], len(hit), len(res["songs"])))
                     res["songs"] = reorder_search_songs(res["songs"])
+            # 列表类响应：后台预热前两首，用户点下去基本秒开
+            if path not in ("/lyric", "/song/url"):
+                for _sid in collect_song_ids(data, PREWARM_PER_LIST):
+                    prewarm_song(_sid)
             body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         except Exception:
             pass
