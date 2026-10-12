@@ -30,8 +30,9 @@ export const usePlayerStore = defineStore("player", {
     autoContinue: localStorage.getItem("autoContinue") !== "0",   // 无限电台：队列快空时 AI 自动续歌
     continuing: false,
     showCast: false,          // 投屏面板
-    castEntity: "",           // 正在投屏到哪个 HA 播放器
-    castName: "",
+    castMode: "off" as "off" | "airplay" | "remote" | "dlna" | "ha",   // 当前投屏通道
+    castEntity: "",           // 经 HA 投屏时的实体 id
+    castName: "",             // 正在投屏到的设备名
     lyrics: [] as LyricLine[],
     lyricFor: -1,
     ready: false,
