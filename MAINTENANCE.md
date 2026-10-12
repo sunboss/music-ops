@@ -1,15 +1,20 @@
 # R-Music 运维手册（music.1234r.com）
 
+> **本系统是自研的「全新 AI 音乐系统」，不是给 YesPlayMusic 打补丁。**
+> 系统定义、决策记录与路线图见 `README.md` 与 `docs/AI-MUSIC-SYSTEM.md`。
+> 最容易忘的一条界线：**音源由我们自己的 Go 服务决定；网易云只当"目录"用（歌单/歌词/封面），不负责出声。**
+
 ## 架构
 
 ```
 浏览器 ──► Cloudflare ──► music-web (Nginx)
                             ├── /            静态前端 YesPlayMusic + sub_filter 注入定制主题/脚本
                             └── /api/*       ──► music-enhancer (Python, :3001)
-                                                  ├── 官方可用 ──► music-api (netease_cloud_music_api, :3000)
-                                                  └── 官方不可用 ──► Go 换源适配器（跑在国内机）
-                                                                        └── 严格匹配 → 大模型终审
-                                                                              └── 取直链（原生国内出口）
+                                                  ├── 音源主力 ──► 自有 Go 音源引擎（跑在国内机，多平台）
+                                                  │                   └── 严格匹配 → 大模型终审 → 直链（原生国内出口）
+                                                  ├── 目录/元数据 ──► music-api (netease_cloud_music_api, :3000)
+                                                  │                   └── 歌单/专辑/歌手/歌词/封面/推荐（不负责出声）
+                                                  └── 前端 ──► web/ 自研（Vue3 产物替换 dist；旧注入方案已废弃）
 ```
 
 - 线上目录：`/data/sunboss/music`（服务器 `64.83.34.204`）
