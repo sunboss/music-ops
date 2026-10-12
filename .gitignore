@@ -17,3 +17,4 @@ go-music-dl-phase2/
 
 # macOS
 .DS_Store
+analysis/*.png

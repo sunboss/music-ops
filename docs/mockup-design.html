@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>R-Music 重写设计稿</title>
+<style>
+  :root{
+    --bg:#0b0d12; --bg2:#12151d; --card:#171b25; --line:rgba(255,255,255,.08);
+    --fg:#eef2f8; --fg2:#98a2b8; --fg3:#5d6880;
+    --acc:#5b8cff; --acc2:#a855f7; --ok:#22c55e;
+    --r:14px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#05060a;color:var(--fg);font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:22px}
+  h2{font-size:15px;font-weight:600;color:var(--fg2);margin:26px 0 12px;letter-spacing:.04em}
+  h2:first-child{margin-top:0}
+  .wrap{display:flex;gap:26px;align-items:flex-start;flex-wrap:wrap}
+  /* ---------- 桌面 ---------- */
+  .desk{width:720px;background:var(--bg);border-radius:16px;overflow:hidden;border:1px solid var(--line);box-shadow:0 20px 60px rgba(0,0,0,.5)}
+  .d-top{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line)}
+  .d-body{display:flex;height:352px}
+  .d-side{width:168px;border-right:1px solid var(--line);padding:12px 10px;flex:none}
+  .d-side a{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:9px;color:var(--fg2);font-size:13px;text-decoration:none;margin-bottom:2px}
+  .d-side a.on{background:linear-gradient(90deg,rgba(91,140,255,.20),rgba(168,85,247,.12));color:#fff}
+  .d-main{flex:1;padding:16px 18px;overflow:hidden}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  .cover{aspect-ratio:1;border-radius:11px;background:linear-gradient(135deg,#2b3350,#1b1f2e);position:relative;overflow:hidden}
+  .cover:after{content:"";position:absolute;inset:0;background:radial-gradient(120% 80% at 20% 10%,rgba(255,255,255,.12),transparent 60%)}
+  .c1{background:linear-gradient(135deg,#ff5f6d,#ffc371)}
+  .c2{background:linear-gradient(135deg,#4776E6,#8E54E9)}
+  .c3{background:linear-gradient(135deg,#11998e,#38ef7d)}
+  .c4{background:linear-gradient(135deg,#614385,#516395)}
+  .t{margin-top:8px;font-size:12.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .s{font-size:11.5px;color:var(--fg3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .d-bar{display:flex;align-items:center;gap:12px;padding:10px 16px;background:rgba(23,27,37,.86);backdrop-filter:blur(18px);border-top:1px solid var(--line)}
+  .mini-cover{width:40px;height:40px;border-radius:9px;flex:none;background:linear-gradient(135deg,#4776E6,#8E54E9)}
+  .btn{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;background:rgba(255,255,255,.08);flex:none}
+  .btn.p{background:#fff;color:#0b0d12}
+  .prog{flex:1;height:3px;border-radius:2px;background:rgba(255,255,255,.14);position:relative}
+  .prog i{position:absolute;left:0;top:0;bottom:0;width:38%;border-radius:2px;background:var(--acc)}
+  /* ---------- 手机 ---------- */
+  .phone{width:300px;background:var(--bg);border-radius:26px;overflow:hidden;border:1px solid var(--line);box-shadow:0 20px 60px rgba(0,0,0,.5);position:relative}
+  .p-top{display:flex;align-items:center;gap:8px;padding:12px 14px 8px}
+  .p-hero{padding:6px 14px 14px;display:flex;gap:12px;align-items:flex-end}
+  .p-hero .cover{width:96px;height:96px;flex:none;border-radius:12px}
+  .p-list{padding:0 6px 96px}
+  .row{display:flex;align-items:center;gap:10px;padding:8px 8px;border-radius:10px}
+  .row.on{background:rgba(91,140,255,.14)}
+  .row .idx{width:20px;text-align:center;font-size:12px;color:var(--fg3);flex:none}
+  .row .cover{width:40px;height:40px;flex:none;border-radius:8px;aspect-ratio:auto}
+  .row .meta{flex:1;min-width:0}
+  .row .meta b{display:block;font-size:13.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .meta span{font-size:11.5px;color:var(--fg3)}
+  .p-mini{position:absolute;left:8px;right:8px;bottom:60px;display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:13px;background:rgba(28,33,46,.92);backdrop-filter:blur(20px);border:1px solid var(--line)}
+  .p-tabs{position:absolute;left:0;right:0;bottom:0;display:flex;padding:8px 4px 12px;background:rgba(11,13,18,.94);backdrop-filter:blur(20px);border-top:1px solid var(--line)}
+  .p-tabs a{flex:1;text-align:center;font-size:10.5px;color:var(--fg3);text-decoration:none}
+  .p-tabs a.on{color:var(--acc)}
+  .p-tabs a i{display:block;font-size:17px;margin-bottom:2px}
+  .fab{position:absolute;right:12px;bottom:118px;padding:8px 13px;border-radius:20px;font-size:12px;font-weight:600;
+       background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:0 8px 22px rgba(91,140,255,.45)}
+  .note{color:var(--fg2);font-size:12.5px;max-width:300px}
+  .note b{color:#fff}
+  .pill{display:inline-block;padding:2px 8px;border-radius:20px;background:rgba(91,140,255,.16);color:#9dbaff;font-size:11px;margin-right:6px}
+</style>
+</head>
+<body>
+<h2>① 桌面 · 侧栏 + 内容区 + 常驻播放条</h2>
+<div class="wrap">
+  <div class="desk">
+    <div class="d-top">
+      <div style="width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,var(--acc),var(--acc2))"></div>
+      <b style="font-size:13px">R-Music</b>
+      <div style="flex:1"></div>
+      <div style="width:190px;height:30px;border-radius:15px;background:rgba(255,255,255,.07);display:flex;align-items:center;padding:0 12px;color:var(--fg3);font-size:12px">搜索歌曲 / 歌手 / 歌单</div>
+      <div style="width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,.12)"></div>
+    </div>
+    <div class="d-body">
+      <div class="d-side">
+        <a class="on">♫ 首页</a><a>◈ 发现</a><a>▤ 音乐库</a><a>✦ AI 音乐</a>
+        <div style="height:12px"></div>
+        <div style="padding:0 10px;font-size:11px;color:var(--fg3);margin-bottom:6px">我创建的歌单</div>
+        <a>· 深夜写代码</a><a>· 开车</a><a>· 粤语老歌</a>
+      </div>
+      <div class="d-main">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:12px">
+          <b style="font-size:17px">每日推荐</b><span style="font-size:12px;color:var(--fg2)">10月12日 · 为你更新</span>
+        </div>
+        <div class="grid">
+          <div><div class="cover c1"></div><div class="t">晴天</div><div class="s">周杰伦</div></div>
+          <div><div class="cover c2"></div><div class="t">海阔天空</div><div class="s">Beyond</div></div>
+          <div><div class="cover c3"></div><div class="t">平凡之路</div><div class="s">朴树</div></div>
+          <div><div class="cover c4"></div><div class="t">红豆</div><div class="s">王菲</div></div>
+        </div>
+        <div style="display:flex;align-items:baseline;justify-content:space-between;margin:18px 0 12px">
+          <b style="font-size:17px">推荐歌单</b><span style="font-size:12px;color:var(--acc)">查看全部 ›</span>
+        </div>
+        <div class="grid">
+          <div><div class="cover c2"></div><div class="t">公路自由驰骋</div><div class="s">AI 精选 15 首</div></div>
+          <div><div class="cover c4"></div><div class="t">深夜代码流</div><div class="s">AI 精选 8 首</div></div>
+          <div><div class="cover c1"></div><div class="t">燃脂脉冲</div><div class="s">AI 精选 8 首</div></div>
+          <div><div class="cover c3"></div><div class="t">粤语老歌·公路巡礼</div><div class="s">AI 精选 15 首</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="d-bar">
+      <div class="mini-cover"></div>
+      <div style="width:120px"><div style="font-size:12.5px;font-weight:500">平凡之路</div><div style="font-size:11px;color:var(--fg3)">朴树</div></div>
+      <div class="btn">⏮</div><div class="btn p">▶</div><div class="btn">⏭</div>
+      <div class="prog"><i></i></div>
+      <div style="font-size:11px;color:var(--fg2)">1:52 / 5:02</div>
+      <div class="btn" title="AI 一句话点歌" style="background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff">✦</div>
+    </div>
+  </div>
+  <div class="note">
+    <b>桌面布局</b><br>
+    左侧固定导航（含歌单快捷入口）＋ 顶栏搜索 ＋ 底部常驻播放条。播放条右侧新增<b> ✦ AI 按钮</b>：随时一句话点歌，不用离开当前页面。<br><br>
+    <span class="pill">深色为主</span><span class="pill">毛玻璃</span><span class="pill">封面驱动</span>
+  </div>
+</div>
+
+<h2>② 手机 · 底部导航 + 迷你播放条 + 全屏播放器</h2>
+<div class="wrap">
+  <div class="phone">
+    <div class="p-top">
+      <div style="width:22px;height:22px;border-radius:7px;background:linear-gradient(135deg,var(--acc),var(--acc2))"></div>
+      <b style="font-size:12.5px">歌单</b>
+      <div style="flex:1"></div>
+      <span style="font-size:16px;color:var(--fg2)">⌕</span><span style="font-size:16px;color:var(--fg2);margin-left:10px">⋯</span>
+    </div>
+    <div class="p-hero">
+      <div class="cover c2" style="width:96px;height:96px"></div>
+      <div style="min-width:0">
+        <b style="font-size:15px;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">binaryify喜欢的音乐</b>
+        <div style="font-size:11px;color:var(--fg3);margin:3px 0 8px">1267 首 · 我喜欢的音乐</div>
+        <div style="display:flex;gap:8px">
+          <span style="padding:5px 14px;border-radius:16px;background:#fff;color:#0b0d12;font-size:12px;font-weight:600">▶ 播放</span>
+          <span style="padding:5px 10px;border-radius:16px;background:rgba(255,255,255,.1);font-size:12px">♡</span>
+          <span style="padding:5px 10px;border-radius:16px;background:rgba(255,255,255,.1);font-size:12px">⋯</span>
+        </div>
+      </div>
+    </div>
+    <div class="p-list">
+      <div class="row on"><span class="idx">♪</span><div class="cover c1"></div>
+        <div class="meta"><b>我看</b><span>刘弈画 · 2023</span></div><span style="font-size:11px;color:var(--fg3)">4:32</span></div>
+      <div class="row"><span class="idx">2</span><div class="cover c3"></div>
+        <div class="meta"><b>一縷 (一缕)</b><span>大原ゆい子</span></div><span style="font-size:11px;color:var(--fg3)">3:43</span></div>
+      <div class="row"><span class="idx">3</span><div class="cover c4"></div>
+        <div class="meta"><b>CHUCK THE MONEY</b><span>Stephen Sanchez</span></div><span style="font-size:11px;color:var(--fg3)">2:44</span></div>
+      <div class="row"><span class="idx">4</span><div class="cover c2"></div>
+        <div class="meta"><b>断气</b><span>回春丹 · 珍珠走廊</span></div><span style="font-size:11px;color:var(--fg3)">4:53</span></div>
+    </div>
+    <div class="fab">✦ 点歌</div>
+    <div class="p-mini">
+      <div class="mini-cover" style="width:34px;height:34px;border-radius:8px;background:linear-gradient(135deg,#ff5f6d,#ffc371)"></div>
+      <div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">我看</div>
+        <div style="font-size:10.5px;color:var(--fg3)">刘弈画</div></div>
+      <div class="btn p" style="width:28px;height:28px;font-size:12px">▶</div>
+      <span style="font-size:15px;color:var(--fg2)">≡</span>
+    </div>
+    <div class="p-tabs">
+      <a class="on"><i>♫</i>首页</a><a><i>◈</i>发现</a><a><i>▤</i>音乐库</a><a><i>✦</i>AI</a>
+    </div>
+  </div>
+  <div class="note">
+    <b>移动端重建</b><br>
+    底部 Tab 四入口、迷你播放条常驻（点击上滑全屏播放器）、歌单头部横排不截断、歌曲行<b>两行信息</b>（专辑并入副标题，不再挤成“THE…”）、索引/时长右对齐。<br><br>
+    <span class="pill">拇指可达</span><span class="pill">触控 ≥44px</span><span class="pill">安全区适配</span>
+  </div>
+</div>
+</body>
+</html>
