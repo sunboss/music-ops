@@ -25,6 +25,14 @@ n=$(find "$TARGET" -maxdepth 1 -type f \( -name '*.mp3' -o -name '*.flac' -o -na
 echo "   曲目 $n 首，合计 $(du -sh "$TARGET" | cut -f1)"
 echo "   播放清单：$TARGET/library.m3u8 $( [ -f "$TARGET/library.m3u8" ] && echo '(存在)' || echo '(缺失)' )"
 echo
-echo "③ 接下来在 Music Assistant 里：设置 → 添加音乐提供方 → Filesystem（本地/网络文件夹）"
-echo "   路径填：$TARGET"
-echo "   若 MA 跑在另一台机器（如 HAOS）上，把上面这个目录共享给它，或在它上面跑同一脚本。"
+echo "③ 接下来在 Music Assistant 里（MA 在 HAOS 容器里，路径是容器内部路径！）"
+cat <<'TIP'
+   路线 A（推荐，最稳）：把曲库放进 HA 的 media 目录，然后
+     MA → 设置 → 添加音乐源 → Filesystem (local disk) → 路径填 /media/R-Music
+     （容器里能看到的是 HA 的 /media 与 /share，看不到本机 ~/Music）
+   路线 B（最快，2 分钟）：本机开文件共享，然后
+     MA → 设置 → 添加音乐源 → Filesystem (remote share) → smb://<本机IP>/R-Music
+     （macOS：系统设置 → 通用 → 共享 → 文件共享 → 添加本目录，只读即可）
+   注意：mp3/flac 标签已写入文件，MA/Plex/Jellyfin 都能正确认歌；不要用 symlink 共享，
+     部分 SMB 实现不会跟随软链接。
+TIP
