@@ -146,6 +146,16 @@ export const api = {
     return data as { ok: boolean; accepted: number; cached: number };
   },
 
+  /** 播放失败一键诊断（第 4 项优化）：只探测不落盘，返回明确原因 */
+  async diag(id: number | string) {
+    const { data } = await http.get("/client-diag", { params: { id } });
+    return data as {
+      verdict: string; reason: string; cached: boolean;
+      name?: string; artist?: string;
+      sources_tried?: { source: string; ok: boolean; note: string }[];
+    };
+  },
+
   reportTaste(songId: number | string, action: "play" | "skip", played: number, dur: number) {
     return http.post("/client-report", { kind: "taste", id: String(songId), action, played, dur })
       .catch(() => void 0);

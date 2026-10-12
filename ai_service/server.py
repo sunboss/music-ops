@@ -2209,6 +2209,63 @@ class H(BaseHTTPRequestHandler):
             out["verdict"] = "不可播放"
         return self._json(200, out)
 
+    def handle_client_diag(self, query):
+        """用户可见的失败诊断（第 4 项优化）：前端播放失败时一键探测原因。
+        只做探测：绝不落盘、绝不缓存 URL、不暴露内部直链。例：/api/client-diag?id=xxx
+        返回 {verdict, reason, cached, sources_tried:[{source, ok, note}]}"""
+        prm = urllib.parse.parse_qs(query or "")
+        sid = (prm.get("id", [""])[0] or "").strip()
+        if not sid:
+            return self._json(400, {"error": "需要 id 参数"})
+        name, artist, album, dur = song_detail(sid)
+        out = {"song_id": sid, "name": name, "artist": artist, "cached": bool(audio_cached(sid))}
+        if out["cached"]:
+            out["verdict"], out["reason"] = "可播放", "音频已在服务器缓存，可直接播放"
+            return self._json(200, out)
+        attempts = []
+        src_note = ""
+        # 1) 各换源平台逐个严格匹配（与播放同链路，只探测不下载）
+        if name:
+            q = urllib.parse.urlencode({"name": name, "artist": artist, "album": album,
+                                        "duration": str(dur or 0), "sources": FALLBACK_SOURCES,
+                                        "detail": "1"})
+            try:
+                res = go_call("/resolve-best?" + q, timeout=25)
+                # 200 = 有匹配：结果在 song/url 字段，attempts 往往为空
+                if res.get("song") or is_http(res.get("url")):
+                    attempts.append({"source": (res.get("song") or {}).get("source") or "matched",
+                                     "ok": True, "note": "匹配成功（%s）"
+                                     % ((res.get("song") or {}).get("source") or "")[:20]})
+                for a in (res.get("attempts") or []):
+                    attempts.append({"source": a.get("source", "?"),
+                                     "ok": a.get("status") == "matched",
+                                     "note": (a.get("status") or "")[:60]})
+            except urllib.error.HTTPError as e:
+                try:
+                    body = json.loads(e.read().decode("utf-8"))
+                except Exception:
+                    body = {}
+                for a in (body.get("attempts") or []):
+                    attempts.append({"source": a.get("source", "?"), "ok": False,
+                                     "note": (a.get("status") or a.get("error") or "无匹配")[:60]})
+                if not attempts:
+                    src_note = "全部平台无匹配直链（404）"
+            except Exception as e:
+                src_note = "音源引擎不可达: %s" % str(e)[:60]
+        else:
+            src_note = "曲库查不到这首歌的元数据"
+        out["sources_tried"] = attempts
+        # 2) 结论
+        if any(a["ok"] for a in attempts):
+            out["verdict"], out["reason"] = "可播放", "换源引擎有直链，可能是刚才网络抖动，请重试播放"
+        elif src_note:
+            out["verdict"], out["reason"] = "暂不可播放", src_note
+        else:
+            bad = "、".join(sorted({a["source"] for a in attempts if not a["ok"]})) or "全部"
+            out["verdict"] = "暂不可播放"
+            out["reason"] = "全部平台（%s）都没有匹配到完整音源（多为 VIP 或版权限制）" % bad
+        return self._json(200, out)
+
     # ------------------------------------------------------------ 本地文件播放
     def serve_audio_file(self, path):
         """从本地文件播放，完整支持 Range（拖动进度依赖）"""
@@ -2650,6 +2707,8 @@ class H(BaseHTTPRequestHandler):
             return self.handle_audio_proxy(p.query)
         if real == "/debug/song":
             return self.handle_debug_song(p.query)
+        if real == "/client-diag":
+            return self.handle_client_diag(p.query)
         if real == "/ai/query":
             return self.handle_ai_query(p.query)
         if real == "/favorites":

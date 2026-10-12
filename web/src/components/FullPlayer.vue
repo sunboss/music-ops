@@ -5,12 +5,33 @@ import {
 } from "lucide-vue-next";
 import { isFav, toggleFav } from "@/utils/favorites";
 import { usePlayerStore } from "@/stores/player";
+import { api } from "@/api/client";
 import { activeLine } from "@/utils/lrc";
 import Cover from "./Cover.vue";
 
 const p = usePlayerStore();
 const showLyric = ref(true);
 const liked = ref(false);
+// —— 播放失败诊断（第 4 项优化）——
+const diagText = ref("");       // 探测结论（一行）
+const diagDetail = ref("");     // 各平台明细
+const diagBusy = ref(false);
+watch(() => p.current?.id, () => { diagText.value = ""; diagDetail.value = ""; });
+async function runDiag() {
+  if (!p.current || diagBusy.value) return;
+  diagBusy.value = true;
+  diagText.value = "正在探测各音源平台…";
+  try {
+    const d = await api.diag(p.current.id);
+    diagText.value = `【${d.verdict}】${d.reason}`;
+    const rows = (d.sources_tried || []).map((s) => `${s.ok ? "✓" : "✕"} ${s.source}: ${s.note}`);
+    diagDetail.value = rows.join("\n");
+  } catch {
+    diagText.value = "诊断服务暂时不可用，请稍后重试";
+  } finally {
+    diagBusy.value = false;
+  }
+}
 const syncLiked = () => { liked.value = isFav(p.current?.id); };
 watch(() => p.current?.id, syncLiked, { immediate: true });
 function like() { liked.value = toggleFav(p.current); }
@@ -78,6 +99,11 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
       </div>
 
       <footer class="ft">
+        <div v-if="p.error || diagText" class="diag" @click="runDiag">
+          <template v-if="diagText">{{ diagText }}</template>
+          <template v-else>{{ p.error }} · 点此诊断原因</template>
+          <pre v-if="diagDetail" class="diag-detail">{{ diagDetail }}</pre>
+        </div>
         <div class="track" @click="seek"><i :style="{ width: pct + '%' }" /></div>
         <div class="times tnum"><span>{{ fmt(p.progress) }}</span><span>{{ fmt(p.duration) }}</span></div>
         <div class="ctl">
@@ -109,6 +135,9 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
       filter: blur(60px) saturate(150%) brightness(.5); transform: scale(1.2); }
 .fp:before { content: ""; position: absolute; inset: 0; background: rgba(0,0,0,.55); }
 .hd, .body, .ft { position: relative; z-index: 1; }
+.diag { margin: 0 0 8px; padding: 8px 12px; border-radius: 10px; background: rgba(255,80,80,.16);
+        border: 1px solid rgba(255,120,120,.35); font-size: 12px; cursor: pointer; line-height: 1.5; }
+.diag-detail { margin: 6px 0 0; font-size: 11px; opacity: .8; white-space: pre-wrap; font-family: inherit; }
 .hd { display: flex; align-items: center; gap: 12px; padding: 14px 18px 6px; }
 .hd .ttl { flex: 1; min-width: 0; text-align: center; }
 .hd .from { font-size: 11px; opacity: .65; letter-spacing: .04em; }
