@@ -127,6 +127,27 @@
   `www-huawei-com:NetworkSyncService`，描述请求对任何 UA 都 403）；那条"1 台"是我自己的模拟渲染器。
 - **规则**：只看 `urn:schemas-upnp-org:device:MediaRenderer:1` 且描述可取的设备才算投屏目标。
 
+### D4 HA 投屏**不能**让浏览器直连 Home Assistant
+- **现象**：`web/src/utils/ha.ts` 从页面直接 fetch `http://192.168.1.240/api/states`（token 在 localStorage），
+  在真机上永远失败，提示「连不上 Home Assistant」。
+- **两条硬阻断（实测）**：
+  1. **混合内容**：`music.1234r.com` 是 HTTPS，HA 在 `192.168.1.240:80` 是**明文 HTTP** →
+     浏览器直接拦掉（手机、电脑都一样），跟 token 对不对无关。
+  2. **无 CORS**：`curl -H 'Origin: https://music.1234r.com' http://192.168.1.240/api/states`
+     返回 401 且**没有** `Access-Control-Allow-Origin` → 即使有 token 也会被当成网络错误。
+  另外 `ha.1234r.com` 并不存在（HA 只有局域网地址），东京服务器也够不到 `192.168.1.x`。
+- **正确解法**：HA 必须接到**服务器侧**——家里常驻反向隧道（`ssh -R`）到 `64.83.34.204`，
+  nginx 用**同源** `/api/ha/*` 转发，token 存服务器 600 文件（不进浏览器）。
+  这样手机也能投小爱，且没有 mixed content / CORS 问题。**待办，用户决定本轮先不做。**
+- **小爱只能走这条**：小爱音箱不在 mDNS/SSDP 里（小米 MiIO 私有协议），
+  AirPlay/DLNA 都发现不了它，只有 HA 的 `media_player.*` 能看到 → 浏览器永远发现不了它。
+
+### D5 DLNA 小桥可以离网自验（用假渲染器）
+- **做法**：本网络没有真 DLNA 渲染器，起 `tools/fake-dlna-renderer.py`
+  （回 SSDP M-SEARCH + 提供 device.xml + 收 AVTransport），即可端到端验证发现与投屏，不用等真设备。
+- **已验过**：`/devices` 发现 1 台 → `/cast` 成功 → 假渲染器收到
+  `SetAVTransportURI`（带真实音频直链）/`Play`/`Stop`；`/cast` 的 CORS 预检返回 204。
+
 ---
 
 ## E. 文档与协作
