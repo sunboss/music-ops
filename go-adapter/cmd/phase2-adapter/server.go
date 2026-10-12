@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -181,6 +182,32 @@ func handleResolveURL(w http.ResponseWriter, r *http.Request) {
 
 func kwOf(s model.Song) string { return strings.TrimSpace(s.Artist + " " + s.Name) }
 
+// queryVariants 搜索词变体：先「歌手 歌名」，再单用歌名
+func queryVariants(want model.Song) []string {
+	var out []string
+	if v := kwOf(want); v != "" {
+		out = append(out, v)
+	}
+	n := strings.TrimSpace(want.Name)
+	if n != "" && n != kwOf(want) {
+		out = append(out, n)
+	}
+	return out
+}
+
+// hasMatch 候选里是否已有严格匹配
+func hasMatch(want model.Song, songs []model.Song) bool {
+	for i := range songs {
+		if songs[i].IsInvalid || songs[i].IsVIP {
+			continue
+		}
+		if match(want, songs[i]) == "" {
+			return true
+		}
+	}
+	return false
+}
+
 func truncateStr(s string, n int) string {
 	if len(s) > n {
 		return s[:n] + "..."
@@ -217,9 +244,31 @@ func handleResolveBest(w http.ResponseWriter, r *http.Request) {
 			attempts = append(attempts, attempt{Source: src, Status: "unsupported_source"})
 			continue
 		}
-		songs, err := search(kwOf(want))
-		if err != nil {
-			attempts = append(attempts, attempt{Source: src, Status: "upstream_error", Error: err.Error()})
+		// 各平台对「歌手 歌名」的召回差异很大：只用一种写法会漏掉大量可播放曲目
+		// （实测「陈奕迅 十年」只回 3 条，去掉歌手搜「十年」回 7 条）。
+		// 这里合并多个搜索词的候选，只要其中一条严格匹配即可。
+		songs := []model.Song{}
+		seen := map[string]bool{}
+		var searchErr error
+		for _, q := range queryVariants(want) {
+			got, err := search(q)
+			if err != nil {
+				searchErr = err
+				continue
+			}
+			for _, s := range got {
+				key := fmt.Sprintf("%s\x1f%s\x1f%d", s.Name, s.Artist, s.Duration)
+				if !seen[key] {
+					seen[key] = true
+					songs = append(songs, s)
+				}
+			}
+			if hasMatch(want, songs) {
+				break // 已经能匹配上，不必再换搜索词
+			}
+		}
+		if searchErr != nil && len(songs) == 0 {
+			attempts = append(attempts, attempt{Source: src, Status: "upstream_error", Error: searchErr.Error()})
 			continue
 		}
 		if len(songs) == 0 {
@@ -294,6 +343,47 @@ func loadCookies(path string) {
 	log.Printf("已注入 %d 个来源的 Cookie: %v", len(cookieSources), cookieSources)
 }
 
+// handleFetch 通过本进程的出口（容器已配好国内代理）代抓音频。
+// 为什么音频也必须走这里：国内平台对海外 IP 可能只返回 30 秒试听片段，
+// 直连抓取即使时长校验能看出问题，也拿不到完整音频。
+// 传 url= 为要抓的地址；Range 头原样透传，返回上游状态码与关键响应头。
+func handleFetch(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(r.URL.Query().Get("url"))
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		writeJSON(w, 400, map[string]string{"error": "url must be http(s)"})
+		return
+	}
+	req, err := http.NewRequest("GET", raw, nil)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Header.Set("User-Agent", browserUAHeader)
+	if rg := r.Header.Get("Range"); rg != "" {
+		req.Header.Set("Range", rg)
+	}
+	client := &http.Client{Timeout: 10 * time.Minute} // 走代理抓整曲，给足时间
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("fetch failed %s: %v", truncateStr(raw, 60), err)
+		writeJSON(w, 502, map[string]string{"error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	for _, k := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"} {
+		if v := resp.Header.Get(k); v != "" {
+			w.Header().Set(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("fetch stream interrupted: %v", err)
+	}
+}
+
+const browserUAHeader = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+	"(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:0", "loopback listen address")
 	cookies := flag.String("cookies", "/data/cookies.json", "按来源提供 Cookie 的 JSON 文件路径")
@@ -304,6 +394,7 @@ func main() {
 	mux.HandleFunc("/resolve", handleResolve)
 	mux.HandleFunc("/resolve-url", handleResolveURL)
 	mux.HandleFunc("/resolve-best", handleResolveBest)
+	mux.HandleFunc("/fetch", handleFetch)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"app": "phase2-adapter", "status": "ok",
 			"time": time.Now().Format(time.RFC3339), "cookie_sources": cookieSources})
