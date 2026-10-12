@@ -635,8 +635,26 @@ def _private_ip(ip):
             or ip.startswith("127.") or ip.startswith("::1") or ip == "172.20.0.1")
 
 
+def _private_host(host):
+    """局域网/本机来源：自家网络的访问（含本地预览、手机连同一 Wi-Fi）都属于自己"""
+    h = (host or "").lower()
+    if h in ("localhost", "::1") or h.endswith(".local"):
+        return True
+    if h.startswith("127.") or h.startswith("10.") or h.startswith("192.168."):
+        return True
+    if h.startswith("172."):
+        try:
+            return 16 <= int(h.split(".")[1]) <= 31
+        except Exception:
+            return False
+    return False
+
+
 def referer_allowed(handler):
-    """带 Referer 但不是我们自己站点的 → 拒绝；没带 Referer 的放行（自家播放器/诊断工具）"""
+    """带 Referer 但不是我们自己站点、也不是局域网来源的 → 拒绝（防外站盗链）。
+    没带 Referer 的放行（自家播放器/诊断工具）。
+    注意：本地预览用局域网地址访问时 Referer 是 192.168.x.x，必须放行，
+    否则「防盗链」会把自家手机挡在门外。"""
     ref = handler.headers.get("Referer") or handler.headers.get("Origin") or ""
     if not ref:
         return True
@@ -646,7 +664,9 @@ def referer_allowed(handler):
         return True
     if not host:
         return True
-    return any(a.strip() and a.strip() in host for a in ALLOWED_REFERERS)
+    if any(a.strip() and a.strip() in host for a in ALLOWED_REFERERS):
+        return True
+    return _private_host(host)
 
 
 RECHECK_EVERY = int(os.getenv("RECHECK_EVERY", "1800"))    # 每 30 分钟复核一批

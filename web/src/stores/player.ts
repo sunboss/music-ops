@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { api } from "@/api/client";
 import type { Song } from "@/api/types";
 import { parseLrc, type LyricLine } from "@/utils/lrc";
+import { pushHistory } from "@/utils/history";
 
 /**
  * 播放器内核：全局单例的原生 <audio>，路由切换绝不重建。
@@ -127,6 +128,7 @@ export const usePlayerStore = defineStore("player", {
           return;
         }
         song.playable = true;
+        pushHistory(song);                       // 本地播放历史（音乐库/离线可见）
         this.duration = Math.round((song.dt || 0) / 1000);
         el.src = item.url;
         playStart = Date.now();
