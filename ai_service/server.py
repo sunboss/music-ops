@@ -1607,48 +1607,80 @@ def stream_headers(url):
     return h
 
 
-def fetch_to_disk(sid, up_url, expected=0, timeout=90):
-    """整首音频落盘。签名直链时效很短，落盘后播放与拖动都不再依赖它。"""
+def _adapter_bases():
+    """国内适配器地址（主 + 备用）"""
+    return [b.rstrip("/") for b in (GO_ADAPTER, GO_ADAPTER_FALLBACK) if b]
+
+
+def _via_adapter_url(up_url):
+    """把音频地址包成「经国内适配器代抓」的 URL"""
+    return "/fetch?url=" + urllib.parse.quote(up_url, safe="")
+
+
+def fetch_to_disk(sid, up_url, expected=0, timeout=90, via_adapter=False):
+    """整首音频落盘。签名直链时效很短，落盘后播放与拖动都不再依赖它。
+
+    via_adapter=True：改由国内适配器的 /fetch 代抓。
+    为什么需要：实测部分平台直链与**国内 IP 绑定**（千千/dmhmusic 系：东京出口 403、国内出口 206），
+    另有些平台对海外 IP 只返回 30 秒试听片段 —— 这类失败不是"没音源"，而是出口不对。
+    代价是隧道带宽只有 ~335KB/s（对比东京直取 9MB/s），所以只在直取失败时用。
+    """
     os.makedirs(AUDIO_DIR, exist_ok=True)
     tmp = os.path.join(AUDIO_DIR, sid + ".part")
-    try:
-        req = urllib.request.Request(up_url, headers=stream_headers(up_url))
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            ext = audio_ext(r.headers.get("Content-Type"), up_url)
-            n = 0
-            with open(tmp, "wb") as f:
-                while True:
-                    c = r.read(262144)
-                    if not c:
-                        break
-                    f.write(c)
-                    n += len(c)
-        if n < 10240:
-            os.remove(tmp)
-            print("[Enhancer] 落盘内容过小(%d 字节)，丢弃 %s" % (n, sid))
-            return None, "too_small"
-        final = os.path.join(AUDIO_DIR, sid + ext)
-        os.replace(tmp, final)
-        ok, actual = duration_ok(final, expected)
-        if not ok:
+
+    targets = []
+    if via_adapter:
+        for base in _adapter_bases():
+            targets.append((base + _via_adapter_url(up_url), {"User-Agent": UA_BROWSER, "Accept": "*/*"}))
+        timeout = max(timeout, 600)          # 隧道慢，给足时间
+    else:
+        targets.append((up_url, stream_headers(up_url)))
+
+    last = "fetch_error"
+    for req_url, hdrs in targets:
+        try:
+            req = urllib.request.Request(req_url, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                ext = audio_ext(r.headers.get("Content-Type"), up_url)
+                n = 0
+                with open(tmp, "wb") as f:
+                    while True:
+                        c = r.read(262144)
+                        if not c:
+                            break
+                        f.write(c)
+                        n += len(c)
+            if n < 10240:
+                os.remove(tmp)
+                print("[Enhancer] 落盘内容过小(%d 字节)，丢弃 %s" % (n, sid))
+                last = "too_small"
+                continue
+            final = os.path.join(AUDIO_DIR, sid + ext)
+            os.replace(tmp, final)
+            ok, actual = duration_ok(final, expected)
+            if not ok:
+                try:
+                    os.remove(final)
+                except Exception:
+                    pass
+                print("[Enhancer] 时长不符被拒：%s 期望 %.0f 秒，实际只有 %.1f 秒（试听片段或占位音频）"
+                      % (sid, expected or 0, actual))
+                last = "duration_rejected"
+                continue
+            print("[Enhancer] 整曲落盘 %s (%d 字节 %s, 实测 %.1f 秒)%s"
+                  % (sid, n, ext, actual, "（国内出口）" if via_adapter else ""))
+            evict_audio()
+            return final, "ok"
+        except Exception as e:
+            last = "fetch_error"
+            print("[Enhancer] 落盘失败 %s%s: %s"
+                  % (sid, "（国内出口）" if via_adapter else "", str(e)[:90]))
             try:
-                os.remove(final)
+                if os.path.exists(tmp):
+                    os.remove(tmp)
             except Exception:
                 pass
-            print("[Enhancer] 时长不符被拒：%s 期望 %.0f 秒，实际只有 %.1f 秒（试听片段或占位音频）"
-                  % (sid, expected or 0, actual))
-            return None, "duration_rejected"
-        print("[Enhancer] 整曲落盘 %s (%d 字节 %s, 实测 %.1f 秒)" % (sid, n, ext, actual))
-        evict_audio()
-        return final, "ok"
-    except Exception as e:
-        print("[Enhancer] 落盘失败 %s: %s" % (sid, e))
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
-        return None, "fetch_error"
+    return None, last
 
 
 # ------------------------------------------------- 灰色歌曲处理（保持原样）
@@ -2377,21 +2409,32 @@ class H(BaseHTTPRequestHandler):
                     build_entry(sid, cand, dur, src)
                     print("[Enhancer] 采用 %s 来源完成落盘 %s (%s)" % (src, sid, name))
                 return self.serve_audio_file(lp)
-            if why == "duration_rejected":
+            # 直取失败（403 或只给 30 秒片段）→ 换国内出口再取一次。
+            # 实测：部分平台直链与国内 IP 绑定（千千/dmhmusic：东京 403、国内 206），
+            # 也有平台对海外 IP 只发试听片段 —— 这类失败是"出口不对"，不是"没音源"。
+            lp_cn, why_cn = fetch_to_disk(sid, cand, dur, via_adapter=True)
+            if lp_cn:
+                build_entry(sid, cand, dur, src + "+cn")
+                print("[Enhancer] 国内出口取流成功 %s (%s) ← %s" % (sid, name, src))
+                return self.serve_audio_file(lp_cn)
+
+            if why == "duration_rejected" and why_cn == "duration_rejected":
                 rejected += 1
-                print("[Enhancer] %s 来源是片段，继续尝试下一个 %s" % (src, sid))
+                print("[Enhancer] %s 来源两侧出口都只是片段，换下一个候选 %s" % (src, sid))
                 continue
-            print("[Enhancer] %s 来源落盘失败(%s) %s" % (src, why, sid))
+            print("[Enhancer] %s 来源落盘失败(直取=%s 国内=%s) %s" % (src, why, why_cn, sid))
             up_url = up_url or cand
 
             # 直链过期 / 被上游拒绝：立刻用 Go 引擎重新解析一次（签名链接寿命很短，重试往往就换到新链）
-            if src == "go" and why == "fetch_error" and name:
+            if src == "go" and name:
                 res2 = go_resolve(name, artist, album, dur)
                 fb2 = (res2 or {}).get("url")
                 if is_http(fb2) and fb2 not in seen:
                     seen.add(fb2)
                     print("[Enhancer] 直链失效，重新解析后重试 %s" % sid)
                     lp, why2 = fetch_to_disk(sid, fb2, dur)
+                    if not lp:
+                        lp, why2 = fetch_to_disk(sid, fb2, dur, via_adapter=True)   # 再走国内出口
                     if lp:
                         build_entry(sid, fb2, dur, "go")
                         print("[Enhancer] 重解析成功并落盘 %s (%s)" % (sid, name))
