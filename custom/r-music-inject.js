@@ -3,7 +3,7 @@
  * 仅保留：顶部导航栏品牌 Logo；并清除旧版 Service Worker 缓存，保证增强脚本生效
  */
 (function () {
-  window.__RM_VERSION = "20261012w";
+  window.__RM_VERSION = "20261012y";
 
   (async function killOldServiceWorker() {
     try {
@@ -242,6 +242,9 @@
     "#rm-ai-input{flex:1;min-width:0;padding:9px 12px;border-radius:9px;border:1px solid rgba(255,255,255,.18);",
     "background:rgba(255,255,255,.08);color:#fff;font-size:14px;outline:none}",
     "#rm-ai-go{padding:9px 13px;border:0;border-radius:9px;background:#4FACFE;color:#fff;font-weight:600;cursor:pointer;white-space:nowrap}",
+    "#rm-ai-mic{padding:9px 11px;border:0;border-radius:9px;background:rgba(255,255,255,.12);color:#fff;cursor:pointer;white-space:nowrap;font-size:15px}",
+    "#rm-ai-mic.on{background:#ff4d6d;animation:rm-pulse 1s infinite}",
+    "@keyframes rm-pulse{0%,100%{opacity:1}50%{opacity:.45}}",
     "#rm-ai-go.radio{background:#7F00FF}",
     "#rm-ai-chips{padding:0 14px 6px;display:flex;flex-wrap:wrap;gap:6px}",
     "#rm-ai-chips i{padding:3px 8px;border-radius:11px;background:rgba(255,255,255,.09);font-size:12px;",
@@ -271,7 +274,8 @@
     '<div class="hd"><span style="cursor:default;font-weight:600">AI 音乐<span id="rm-ai-title" ' +
     'style="font-weight:400;opacity:.7;font-size:12px;margin-left:8px"></span></span>' +
     '<span id="rm-ai-x">&times;</span></div>' +
-    '<div class="bd"><input id="rm-ai-input" placeholder="说一句，例如：深夜写代码听的">' +
+    '<div class="bd"><input id="rm-ai-input" placeholder="说一句，或用麦克风说">' +
+    '<button id="rm-ai-mic" title="按住说话（语音点歌）" style="display:none">&#127908;</button>' +
     '<button id="rm-ai-go">点歌</button></div>' +
     '<div id="rm-ai-chips"></div>' +
     '<div id="rm-ai-reply"></div><div id="rm-ai-now"></div>' +
@@ -415,9 +419,104 @@
     if (panel.style.display === "flex") document.getElementById("rm-ai-input").focus();
   };
   document.getElementById("rm-ai-x").onclick = function () { panel.style.display = "none"; };
+  // 语音点歌：浏览器原生语音识别（HTTPS 下可用），说完直接生成电台
+  (function () {
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    var mic = document.getElementById("rm-ai-mic");
+    if (!SR || !mic) { return; }
+    mic.style.display = "block";
+    var rec = null;
+    mic.onclick = function () {
+      if (rec) { try { rec.stop(); } catch (e) {} return; }
+      rec = new SR();
+      rec.lang = "zh-CN";
+      rec.interimResults = false;
+      rec.maxAlternatives = 1;
+      mic.classList.add("on");
+      var old = document.getElementById("rm-ai-reply").textContent;
+      document.getElementById("rm-ai-reply").textContent = "在听你说…";
+      rec.onresult = function (e) {
+        var t = (e.results && e.results[0] && e.results[0][0] && e.results[0][0].transcript) || "";
+        document.getElementById("rm-ai-input").value = t;
+        rec = null; mic.classList.remove("on");
+        if (t) { ask("radio"); } else { document.getElementById("rm-ai-reply").textContent = old; }
+      };
+      rec.onerror = function (e) {
+        rec = null; mic.classList.remove("on");
+        document.getElementById("rm-ai-reply").textContent =
+          (e.error === "not-allowed") ? "麦克风未授权，请在浏览器里允许后重试" : ("语音识别失败：" + e.error);
+      };
+      rec.onend = function () { mic.classList.remove("on"); rec = null; };
+      try { rec.start(); } catch (e) {
+        mic.classList.remove("on"); rec = null;
+        document.getElementById("rm-ai-reply").textContent = "语音识别启动失败：" + e;
+      }
+    };
+  })();
+
   document.getElementById("rm-ai-go").onclick = function () { ask("song"); };
   document.getElementById("rm-ai-go").ondblclick = function () { ask("radio"); };
   document.getElementById("rm-ai-input").addEventListener("keydown", function (e) {
     if (e.key === "Enter") { ask(e.shiftKey ? "radio" : "song"); }
   });
+})();
+
+
+/* 口味记忆：记录真实收听行为（听了 / 跳过），服务端据此让 AI 更懂你 */
+(function () {
+  if (window.__rmTaste) return;
+  window.__rmTaste = true;
+
+  function sidOf(u) {
+    var m = /[?&]id=(\d+)/.exec(u || "");
+    return m ? m[1] : null;
+  }
+  function send(id, action, played, dur) {
+    try {
+      fetch("/api/client-report", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({kind: "taste", id: id, action: action,
+                              played: Math.round(played || 0), dur: Math.round(dur || 0),
+                              v: window.__RM_VERSION})
+      });
+    } catch (e) {}
+  }
+
+  var cur = null, timer = null;
+
+  function flush(reason) {
+    if (!cur || !cur.sid) { cur = null; return; }
+    var played = cur.max || 0, dur = cur.dur || 0;
+    if (!cur.reported) {                       // 已上报过就不再重复
+      if (reason === "ended" || played >= 30) { send(cur.sid, "play", played, dur); }
+      else if (played >= 3 && played < 20) { send(cur.sid, "skip", played, dur); }  // 听了十几秒就切走 = 不喜欢
+    }
+    cur = null;
+  }
+
+  function tick() {
+    var best = 0, el = null;
+    Array.prototype.forEach.call(document.querySelectorAll("audio"), function (a) {
+      if (!a.paused && a.currentTime > best) { best = a.currentTime; el = a; }
+    });
+    if (!el) { return; }
+    var sid = sidOf(el.src);
+    if (!sid) { return; }
+    if (!cur || cur.sid !== sid) { flush("switch"); cur = {sid: sid, max: 0, dur: 0}; }
+    cur.max = Math.max(cur.max || 0, el.currentTime || 0);
+    cur.dur = el.duration || cur.dur || 0;
+    // 听满 30 秒就立刻记账：不能只等切歌/关闭页面上报，
+    // 否则用户一直听下去这条记录永远不会落库
+    if (cur.max >= 30 && !cur.reported) {
+      cur.reported = true;
+      send(cur.sid, "play", cur.max, cur.dur);
+    }
+    if (el.ended) { flush("ended"); }
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) { flush("hide"); } else { start(); }
+  });
+  function start() { if (!timer) { timer = setInterval(tick, 3000); } }
+  start();
 })();

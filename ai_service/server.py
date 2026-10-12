@@ -653,6 +653,103 @@ RECHECK_EVERY = int(os.getenv("RECHECK_EVERY", "1800"))    # 每 30 分钟复核
 RECHECK_BATCH = int(os.getenv("RECHECK_BATCH", "3"))
 
 
+# ---------------------------------------------------------------- 口味记忆
+def _taste_db():
+    c = sqlite3.connect(CACHE_DB)
+    c.execute("CREATE TABLE IF NOT EXISTS taste (song_id TEXT, action TEXT, played INT, "
+              "dur INT, ts REAL)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_taste ON taste(action, ts)")
+    c.execute("CREATE TABLE IF NOT EXISTS song_meta (song_id TEXT PRIMARY KEY, name TEXT, "
+              "artist TEXT, ts REAL)")
+    return c
+
+
+def meta_remember(sid, name, artist):
+    """记住歌曲元数据，供口味统计时本地取用（避免为了显示名字去打上游接口）"""
+    if not sid or not name:
+        return
+    try:
+        c = _taste_db()
+        c.execute("INSERT OR REPLACE INTO song_meta VALUES (?,?,?,?)",
+                  (str(sid), name, artist or "", time.time()))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+def meta_of(sid):
+    try:
+        c = _taste_db()
+        row = c.execute("SELECT name, artist FROM song_meta WHERE song_id=?",
+                        (str(sid),)).fetchone()
+        c.close()
+        return (row[0], row[1]) if row else (None, None)
+    except Exception:
+        return (None, None)
+
+
+def record_taste(sid, action, played=0, dur=0):
+    """记录一次真实收听行为：play=听了（≥30秒或整曲放完），skip=没听进去就切了"""
+    if not sid or action not in ("play", "skip"):
+        return
+    try:
+        c = _taste_db()
+        c.execute("INSERT INTO taste VALUES (?,?,?,?,?)",
+                  (str(sid), action, int(played or 0), int(dur or 0), time.time()))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+def taste_context(days=30, top=6):
+    """给大模型的口味上下文：常听歌手 + 常被跳过的歌。没有数据时返回空串。"""
+    try:
+        since = time.time() - days * 86400
+        c = _taste_db()
+        plays = c.execute(
+            "SELECT song_id, COUNT(*) n, SUM(played) s, MAX(dur) d FROM taste "
+            "WHERE action='play' AND ts>? GROUP BY song_id ORDER BY n DESC, s DESC LIMIT ?",
+            (since, top)).fetchall()
+        skips = c.execute(
+            "SELECT song_id, COUNT(*) n FROM taste WHERE action='skip' AND ts>? "
+            "GROUP BY song_id ORDER BY n DESC LIMIT ?", (since, top)).fetchall()
+        total = c.execute("SELECT COUNT(*) FROM taste WHERE ts>?", (since,)).fetchone()[0]
+        c.close()
+    except Exception:
+        return ""
+    if total < 3:
+        return ""
+    def label(sid):
+        n, a = meta_of(sid)
+        return "%s%s" % (n or sid, ("-" + a) if a else "")
+    artists = []
+    for sid, _n, _s, _d in plays:
+        _nm, ar = meta_of(sid)
+        for x in [p.strip() for p in (ar or "").replace("&", "/").replace(",", "/").split("/") if p.strip()]:
+            if x not in artists:
+                artists.append(x)
+    parts = []
+    if plays:
+        parts.append("常听：" + "、".join(label(s) for s, _n, _s, _d in plays[:5]))
+    if artists:
+        parts.append("偏好歌手：" + "、".join(artists[:6]))
+    if skips:
+        parts.append("经常跳过（不要再推荐）：" + "、".join(label(s) for s, _n in skips[:5]))
+    return "；".join(parts)
+
+
+def taste_stats():
+    try:
+        c = _taste_db()
+        r = c.execute("SELECT action, COUNT(*) FROM taste GROUP BY action").fetchall()
+        c.close()
+        return dict(r)
+    except Exception:
+        return {}
+
+
 def unplayable_expiring(limit):
     """挑最快到期的几条「无音源」记录来复核（越接近到期越该重试）"""
     try:
@@ -1587,8 +1684,13 @@ class H(BaseHTTPRequestHandler):
     # ------------------------------------------------------------ AI 电台/歌单
     def handle_ai_radio(self, text, want=18):
         """一句话生成整张歌单：多关键词检索 + 探活，只交付能完整播放的"""
+        ctx = taste_context()
+        if ctx:
+            print("[Enhancer] 带入口味上下文: %s" % ctx[:140])
+        ask = text + (("\n\n【用户口味参考，用来提高命中偏好，别生硬照搬，也别全用这些】" + ctx)
+                      if ctx else "")
         try:
-            plan = ai_radio_plan(text)
+            plan = ai_radio_plan(ask)
         except Exception as e:
             print("[Enhancer] AI 电台解析失败: %s" % e)
             return self._json(502, {"error": "AI 解析失败: %s" % str(e)[:160]})
@@ -1596,7 +1698,7 @@ class H(BaseHTTPRequestHandler):
         if len(songs) < min(8, want):
             # 不够就再要一轮关键词（最多补一次，避免无限循环）
             try:
-                more = ai_radio_plan(text + "（再给 6 个不同的检索词，避免与上面重复）")
+                more = ai_radio_plan(ask + "（再给 6 个不同的检索词，避免与上面重复）")
                 extra, _ = self._ai_collect(more["keywords"], plan, per_kw=8,
                                             limit=want - len(songs))
                 have = {s["id"] for s in songs}
@@ -1605,8 +1707,8 @@ class H(BaseHTTPRequestHandler):
                 print("[Enhancer] AI 电台补词失败: %s" % e)
         title = plan.get("title") or "AI 电台"
         reply = plan.get("reply") or ""
-        # 让大模型对真实可播歌单做策展（取舍 + 排序 + 命名）
-        cur = ai_curate(text, songs)
+        # 让大模型对真实可播歌单做策展（取舍 + 排序 + 命名）；把口味一并给它
+        cur = ai_curate(text + (("\n【用户口味】" + ctx) if ctx else ""), songs)
         if cur:
             title = cur["title"] or title
             reply = cur["reply"] or reply
@@ -1643,8 +1745,9 @@ class H(BaseHTTPRequestHandler):
                                     "gateway": AI_GATEWAY, "model": AI_MODEL})
         if want:
             return self.handle_ai_radio(text, min(30, max(5, want)))
+        _t = taste_context()
         try:
-            plan = ai_plan(text)
+            plan = ai_plan(text + (("\n【用户口味参考】" + _t) if _t else ""))
         except Exception as e:
             print("[Enhancer] AI 解析失败: %s" % e)
             return self._json(502, {"error": "AI 解析失败: %s" % str(e)[:160]})
@@ -1666,6 +1769,9 @@ class H(BaseHTTPRequestHandler):
 
         playable = [s for s in cand[:24] if s["playable"]]
         songs = (playable or cand)[:plan["count"]]
+        _ctx = taste_context()
+        if _ctx:
+            print("[Enhancer] 点歌带入口味: %s" % _ctx[:100])
         print("[Enhancer] AI 点歌 %r -> 关键词 %s, 候选 %d, 可播 %d, 交付 %d 首"
               % (text[:24], plan["keywords"], len(cand), len(playable), len(songs)))
         reply = plan.get("reply") or ""
@@ -1808,6 +1914,7 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             return
         name, artist, album, dur = song_detail(sid)
+        meta_remember(sid, name, artist)
 
         cands, seen, ai_done = [], set(), False
         if hit and hit[0] and hit[0] != REJECT_MARK:
@@ -2043,6 +2150,15 @@ class H(BaseHTTPRequestHandler):
             print("[Enhancer] 客户端播放 src=%s 时长=%s 秒 位置=%s v=%s ua=%s" % (
                 (d.get("src") or "")[:110], d.get("dur"), d.get("t"), d.get("v"),
                 (d.get("ua") or "")[:50]))
+        elif kind == "taste":
+            # 口味记忆：用户真实听了 / 跳过了什么（主播放器和 AI 面板都会上报）
+            sid = str(d.get("id") or "").strip()
+            act = d.get("action") or ""
+            record_taste(sid, act, d.get("played") or 0, d.get("dur") or 0)
+            n, a = meta_of(sid)
+            print("[Enhancer] 口味记录 %s: %s%s（听了 %s 秒 / 共 %s 秒）"
+                  % (act, n or sid, (" - " + a) if a else "", d.get("played"), d.get("dur")))
+            return self._json(200, {"ok": True, "taste": taste_stats()})
         else:
             print("[Enhancer] 客户端回报: %s" % json.dumps(d, ensure_ascii=False)[:300])
         return self._json(200, {"ok": True, "build": BUILD})
