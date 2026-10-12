@@ -808,9 +808,13 @@ def meta_of(sid):
         return (None, None)
 
 
+# 收藏也记进同一张口味表：它是比"听满 30 秒"强得多的正反馈
+LIKE_ACTIONS = ("like", "unlike")
+
+
 def record_taste(sid, action, played=0, dur=0):
-    """记录一次真实收听行为：play=听了（≥30秒或整曲放完），skip=没听进去就切了"""
-    if not sid or action not in ("play", "skip"):
+    """记录一次真实收听行为：play=听了、skip=没听进去就切了、like/unlike=收藏与否"""
+    if not sid or action not in ("play", "skip") + LIKE_ACTIONS:
         return
     try:
         c = _taste_db()
@@ -820,6 +824,35 @@ def record_taste(sid, action, played=0, dur=0):
         c.close()
     except Exception:
         pass
+
+
+def favorites(limit=500):
+    """当前收藏（每首取最后一次 like/unlike：最后一次是 like 才算收藏）"""
+    try:
+        c = _taste_db()
+        rows = c.execute(
+            "SELECT song_id, action, MAX(ts) t FROM taste WHERE action IN ('like','unlike') "
+            "GROUP BY song_id HAVING action='like' ORDER BY t DESC LIMIT ?", (limit,)).fetchall()
+        c.close()
+    except Exception:
+        return []
+    out = []
+    for sid, _a, t in rows:
+        n, ar = meta_of(sid)
+        out.append({"id": sid, "name": n or "", "artist": ar or "", "liked_at": t})
+    return out
+
+
+def liked_artists(limit=10):
+    """收藏里出现的歌手（口味上下文里权重最高的一类信号）"""
+    got = []
+    for f in favorites(limit * 3):
+        for x in [p.strip() for p in (f.get("artist") or "").replace("&", "/").replace(",", "/").split("/") if p.strip()]:
+            if x not in got:
+                got.append(x)
+        if len(got) >= limit:
+            break
+    return got
 
 
 def taste_context(days=30, top=6):
@@ -843,13 +876,18 @@ def taste_context(days=30, top=6):
     def label(sid):
         n, a = meta_of(sid)
         return "%s%s" % (n or sid, ("-" + a) if a else "")
-    artists = []
+    liked = liked_artists(8)          # 收藏过的歌手，权重最高
+    artists = list(liked)
     for sid, _n, _s, _d in plays:
         _nm, ar = meta_of(sid)
         for x in [p.strip() for p in (ar or "").replace("&", "/").replace(",", "/").split("/") if p.strip()]:
             if x not in artists:
                 artists.append(x)
     parts = []
+    favs = favorites(8)
+    if favs:      # 明确收藏 = 最强信号，放在最前面
+        parts.append("明确收藏（很喜欢，优先满足）："
+                     + "、".join("%s%s" % (f["name"], ("-" + f["artist"]) if f["artist"] else "") for f in favs[:6]))
     if plays:
         parts.append("常听：" + "、".join(label(s) for s, _n, _s, _d in plays[:5]))
     if artists:
@@ -2589,6 +2627,8 @@ class H(BaseHTTPRequestHandler):
             return self.handle_debug_song(p.query)
         if real == "/ai/query":
             return self.handle_ai_query(p.query)
+        if real == "/favorites":
+            return self._json(200, {"favorites": favorites(), "count": len(favorites())})
         if real in ("/ma/play", "/ma/stream"):
             return self.handle_ma_play(p.query)
         if real == "/ma/resolve":
