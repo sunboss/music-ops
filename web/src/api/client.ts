@@ -134,6 +134,12 @@ export const api = {
   },
 
   /** 口味上报：前端按真实收听行为上报，服务端据此让 AI 更懂你 */
+  /** 服务端收藏列表（跨设备/供 AI 使用） */
+  async favorites() {
+    const { data } = await http.get("/favorites");
+    return (data.favorites || []) as { id: string; name: string; artist: string; liked_at: number }[];
+  },
+
   reportTaste(songId: number | string, action: "play" | "skip", played: number, dur: number) {
     return http.post("/client-report", { kind: "taste", id: String(songId), action, played, dur })
       .catch(() => void 0);

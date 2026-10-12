@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { Play, History, Sparkles, ListMusic, Trash2 } from "lucide-vue-next";
+import { Play, History, Sparkles, ListMusic, Trash2, Heart, Radio } from "lucide-vue-next";
+import { readFavs, favSongs, toggleFav } from "@/utils/favorites";
 import { readHistory, clearHistory, type HistoryItem } from "@/utils/history";
 import { api } from "@/api/client";
 import type { Song } from "@/api/types";
@@ -11,7 +12,9 @@ import { usePlayerStore } from "@/stores/player";
 
 const router = useRouter();
 const p = usePlayerStore();
-const tab = ref<"recent" | "daily" | "playlist">("recent");
+const tab = ref<"recent" | "fav" | "daily" | "playlist">("recent");
+const favs = ref(readFavs());
+const radioBusy = ref(false);
 const history = ref<HistoryItem[]>(readHistory());
 const daily = ref<Song[]>([]);
 const playlists = ref<{ id: number; name: string; picUrl?: string; sub?: string }[]>([]);
@@ -53,6 +56,28 @@ async function loadPlaylists() {
 }
 
 function drop() { clearHistory(); history.value = []; }
+
+/** 播收藏（时长等信息播放时由播放器补全） */
+function playFavs(ind = 0) {
+  const list = favSongs();
+  if (list.length) p.playQueue(list, ind);
+}
+
+/** 按收藏生成电台：交给 AI，它拿到的口味上下文里"明确收藏"权重最高 */
+async function favRadio() {
+  if (radioBusy.value) return;
+  radioBusy.value = true;
+  try {
+    const d = await api.aiRadio("像我收藏的那些歌", 15);
+    if (d.songs?.length) p.playQueue(d.songs, 0);
+  } finally { radioBusy.value = false; }
+}
+
+function removeFav(id: number) {
+  const song = favSongs().find((s) => String(s.id) === String(id));
+  if (song) toggleFav(song);
+  favs.value = readFavs();
+}
 function pick(t: typeof tab.value) {
   tab.value = t;
   if (t === "daily") void loadDaily();
@@ -72,6 +97,7 @@ onMounted(() => {
 
     <div class="tabs">
       <button :class="{ on: tab === 'recent' }" @click="pick('recent')"><History :size="15" />最近播放</button>
+      <button :class="{ on: tab === 'fav' }" @click="pick('fav')"><Heart :size="15" />我喜欢的</button>
       <button :class="{ on: tab === 'daily' }" @click="pick('daily')"><Sparkles :size="15" />每日推荐</button>
       <button :class="{ on: tab === 'playlist' }" @click="pick('playlist')"><ListMusic :size="15" />歌单</button>
     </div>
@@ -97,6 +123,31 @@ onMounted(() => {
         </div>
       </div>
       <p v-if="!history.length" class="tip">还没有播放记录。随便播一首，这里就会记下来（只存在你自己的浏览器里）。</p>
+    </template>
+
+    <template v-else-if="tab === 'fav'">
+      <div v-if="favs.length" class="ops">
+        <button class="play" @click="playFavs()"><Play :size="15" fill="currentColor" />播放全部</button>
+        <button class="ghost" :disabled="radioBusy" @click="favRadio">
+          <Radio :size="14" />{{ radioBusy ? "生成中…" : "按收藏生成电台" }}
+        </button>
+        <span class="cnt">{{ favs.length }} 首 · 会喂给 AI 推荐</span>
+      </div>
+      <p v-if="!favs.length" class="tip">
+        还没有收藏。在播放器上点红心就会记到这里 —— 收藏会喂给 AI，之后说一句「像我喜欢的」它就更准。
+      </p>
+      <div v-else class="list">
+        <div v-for="(f, i) in favs" :key="f.id" class="row" :class="{ on: p.current?.id === Number(f.id) }"
+             @dblclick="playFavs(i)">
+          <div class="ix tnum">{{ i + 1 }}</div>
+          <Cover :src="f.pic" :alt="f.name" radius="6px" class="thumb" />
+          <div class="mm">
+            <div class="nm ellipsis">{{ f.name }}</div>
+            <div class="ar ellipsis">{{ f.artist }}</div>
+          </div>
+          <button class="pb" title="取消喜欢" @click.stop="removeFav(f.id)"><Heart :size="14" fill="currentColor" /></button>
+        </div>
+      </div>
     </template>
 
     <template v-else-if="tab === 'daily'">
@@ -155,7 +206,7 @@ onMounted(() => {
 .mm { flex: 1; min-width: 0; }
 .nm { font-size: 14.5px; font-weight: 500; letter-spacing: -.012em; }
 .ar { font-size: 12.5px; color: var(--fg2); }
-.pb { width: 32px; height: 32px; display: grid; place-items: center; color: var(--fg2); }
+.pb { width: 32px; height: 32px; display: grid; place-items: center; color: #ff375f; }
 .tip { padding: 26px 22px; color: var(--fg2); font-size: 13px; max-width: 520px; }
 @media (max-width: 640px) {
   .hero { padding: 16px 14px 8px; } .hero h1 { font-size: 24px; }

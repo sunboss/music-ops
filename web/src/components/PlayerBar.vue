@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { Pause, Play, SkipBack, SkipForward, Sparkles, Cast } from "lucide-vue-next";
+import { Pause, Play, SkipBack, SkipForward, Sparkles, Cast, Heart } from "lucide-vue-next";
+import { isFav, toggleFav } from "@/utils/favorites";
+import { computed as vueComputed } from "vue";
 import CastMenu from "./CastMenu.vue";
 import { usePlayerStore } from "@/stores/player";
 import { useRouter } from "vue-router";
@@ -11,6 +13,9 @@ const router = useRouter();
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 const pct = computed(() => (p.duration ? Math.min(100, (p.progress / p.duration) * 100) : 0));
 const artist = computed(() => (p.current?.ar || []).map((a) => a.name).join(", "));
+
+const liked = vueComputed(() => isFav(p.current?.id));
+function like() { toggleFav(p.current); }
 
 function seek(e: MouseEvent) {
   const el = e.currentTarget as HTMLElement;
@@ -35,6 +40,10 @@ function seek(e: MouseEvent) {
     </button>
     <button class="bt" @click="p.next()" :disabled="!p.hasQueue"><SkipForward :size="17" fill="currentColor" /></button>
     <div class="sp" />
+    <button class="heart" :class="{ on: liked }" :title="liked ? '取消喜欢' : '喜欢（会影响 AI 推荐）'"
+            @click="like" :disabled="!p.current">
+      <Heart :size="15" :fill="liked ? 'currentColor' : 'none'" />
+    </button>
     <div class="tm tnum">{{ fmt(p.progress) }} / {{ fmt(p.duration) }}</div>
     <!-- 投屏：直接弹设备勾选（Safari 走系统列表），不弹页面 -->
     <button class="cast" :class="{ on: !!p.castName }"
@@ -68,6 +77,9 @@ function seek(e: MouseEvent) {
          box-shadow: var(--shadow); font-size: 12.5px; color: var(--fg); z-index: 70; max-width: 80vw; }
 .toast-enter-active, .toast-leave-active { transition: opacity .18s, transform .18s; }
 .toast-enter-from, .toast-leave-to { opacity: 0; transform: translateX(-50%) translateY(6px); }
+.heart { width: 30px; height: 30px; display: grid; place-items: center; color: var(--fg2); border-radius: 8px; }
+.heart.on { color: #ff375f; }
+.heart:disabled { opacity: .4; }
 .cast { display: inline-flex; align-items: center; gap: 6px; max-width: 150px; padding: 5px 10px;
          border-radius: 14px; color: var(--fg2); }
 .cast:hover { background: var(--fill); }

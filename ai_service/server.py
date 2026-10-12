@@ -797,6 +797,16 @@ def meta_remember(sid, name, artist):
         pass
 
 
+def _remember_meta_bg(sid):
+    """后台把歌曲元数据补进 song_meta（用于口味/收藏标签）"""
+    try:
+        name, artist, _al, _d = song_detail(sid)
+        if name:
+            meta_remember(sid, name, artist)
+    except Exception:
+        pass
+
+
 def meta_of(sid):
     try:
         c = _taste_db()
@@ -839,6 +849,14 @@ def favorites(limit=500):
     out = []
     for sid, _a, t in rows:
         n, ar = meta_of(sid)
+        if not n:                      # 旧收藏可能是在 "命中缓存不记元数据" 时期留下的
+            try:
+                n2, ar2, _al, _d = song_detail(sid)
+                if n2:
+                    meta_remember(sid, n2, ar2)
+                    n, ar = n2, ar2
+            except Exception:
+                pass
         out.append({"id": sid, "name": n or "", "artist": ar or "", "liked_at": t})
     return out
 
@@ -2398,6 +2416,11 @@ class H(BaseHTTPRequestHandler):
         # 1) 已整曲落盘 -> 直接本地播放（最快最稳，拖动瞬时响应）
         lp = audio_cached(sid)
         if lp:
+            # 命中缓存时以前直接 return，导致 meta_remember 从不执行 ——
+            # 于是"听过且已落盘"的歌反而没有元数据，收藏/口味的标签就是空的。
+            # 这里补一次后台补记，不占用首播延迟。
+            if not meta_of(sid)[0]:
+                threading.Thread(target=_remember_meta_bg, args=(sid,), daemon=True).start()
             return self.serve_audio_file(lp)
 
         # 2) 依次尝试所有可用来源，凑到「完整音频」为止。

@@ -1,14 +1,19 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import {
-  ChevronDown, Pause, Play, SkipBack, SkipForward, Repeat, Shuffle, ListMusic, Volume2,
+  ChevronDown, Pause, Play, SkipBack, SkipForward, Repeat, Shuffle, ListMusic, Volume2, Heart,
 } from "lucide-vue-next";
+import { isFav, toggleFav } from "@/utils/favorites";
 import { usePlayerStore } from "@/stores/player";
 import { activeLine } from "@/utils/lrc";
 import Cover from "./Cover.vue";
 
 const p = usePlayerStore();
 const showLyric = ref(true);
+const liked = ref(false);
+const syncLiked = () => { liked.value = isFav(p.current?.id); };
+watch(() => p.current?.id, syncLiked, { immediate: true });
+function like() { liked.value = toggleFav(p.current); }
 const lyricBox = ref<HTMLElement | null>(null);
 
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
@@ -47,6 +52,9 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
           <div class="from">正在播放</div>
           <div class="nm ellipsis">{{ p.current.name }}</div>
         </div>
+        <button class="ib" :class="{ on: liked }" title="喜欢（会影响 AI 推荐）" @click="like">
+          <Heart :size="20" :fill="liked ? 'currentColor' : 'none'" />
+        </button>
         <button class="ib" :class="{ on: !showLyric }" title="歌词" @click="showLyric = !showLyric">词</button>
       </header>
 
@@ -80,7 +88,9 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
             <Play v-else :size="28" fill="currentColor" />
           </button>
           <button class="ib" @click="p.next()"><SkipForward :size="24" fill="currentColor" /></button>
-          <button class="ib sm"><Repeat :size="17" /></button>
+          <button class="ib sm" :class="{ on: liked }" title="喜欢" @click="like">
+            <Heart :size="17" :fill="liked ? 'currentColor' : 'none'" />
+          </button>
         </div>
         <div class="ctl2">
           <Volume2 :size="15" />
