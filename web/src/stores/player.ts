@@ -29,6 +29,9 @@ export const usePlayerStore = defineStore("player", {
     showQueue: false,         // 播放队列抽屉
     autoContinue: localStorage.getItem("autoContinue") !== "0",   // 无限电台：队列快空时 AI 自动续歌
     continuing: false,
+    showCast: false,          // 投屏面板
+    castEntity: "",           // 正在投屏到哪个 HA 播放器
+    castName: "",
     lyrics: [] as LyricLine[],
     lyricFor: -1,
     ready: false,

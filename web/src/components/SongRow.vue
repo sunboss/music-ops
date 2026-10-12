@@ -13,15 +13,20 @@ const time = computed(() => {
   const s = Math.round((props.song.dt || 0) / 1000);
   return s ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : "--:--";
 });
-const dead = computed(() => props.song.playable === false);
+/**
+ * 曾经「无音源」的歌之前会被灰掉并禁用点击；现在灰歌已修复（VIP 可用），
+ * 所以不再隐藏、不再禁用——一律允许点击重试，真取不到源时由播放器明确报错。
+ * 只是把本轮确实失败的歌在时长位标注一下，避免用户反复点同一首。
+ */
+const triedDead = computed(() => props.song.playable === false);
 </script>
 
 <template>
-  <div class="row group" :class="{ on: props.active, dead }" @dblclick="!dead && emit('play', props.index)">
+  <div class="row group" :class="{ on: props.active }" @dblclick="emit('play', props.index)">
     <div class="ix tnum">
       <span v-if="props.active" class="pl">♪</span>
       <span v-else class="n">{{ props.index + 1 }}</span>
-      <button class="pv" :disabled="dead" @click.stop="emit('play', props.index)">
+      <button class="pv" @click.stop="emit('play', props.index)">
         <Play :size="14" fill="currentColor" />
       </button>
     </div>
@@ -34,7 +39,7 @@ const dead = computed(() => props.song.playable === false);
       </div>
     </div>
     <div v-if="props.showAlbum" class="ab ellipsis">{{ album }}</div>
-    <div class="du tnum">{{ dead ? "无音源" : time }}</div>
+    <div class="du tnum">{{ triedDead ? "取源失败" : time }}</div>
   </div>
 </template>
 
@@ -43,7 +48,6 @@ const dead = computed(() => props.song.playable === false);
        border-bottom: 0.5px solid var(--hair); }
 .row:hover { background: var(--fill); }
 .row.on { background: var(--acc-weak); border-bottom-color: transparent; }
-.row.dead { opacity: .45; }
 .ix { width: 20px; flex: none; text-align: center; font-size: 13px; color: var(--fg3); position: relative; }
 .row.on .ix { color: var(--acc); }
 .ix .pv { display: none; position: absolute; inset: 0; align-items: center; justify-content: center; color: var(--fg); }

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { Sun, Moon, MonitorSmartphone, Trash2, Check } from "lucide-vue-next";
+import { Sun, Moon, MonitorSmartphone, Trash2, Check, Cast } from "lucide-vue-next";
+import { haCfg, haSave, haPlayers, haHint } from "@/utils/ha";
 import { usePlayerStore } from "@/stores/player";
 import { readHistory, clearHistory } from "@/utils/history";
 
@@ -9,6 +10,35 @@ const theme = ref(localStorage.getItem("theme") || "system");
 const info = ref<{ build?: string; ai?: boolean; ai_model?: string; sources?: string }>({});
 const saved = ref(false);
 const histCount = ref(readHistory().length);
+
+// 投屏：地址与长期令牌只存本机浏览器
+const haUrl = ref(haCfg().url);
+const haToken = ref(haCfg().token);
+const haMsg = ref("");
+const haOk = ref(false);
+const haTesting = ref(false);
+
+function saveHa() {
+  haSave(haUrl.value, haToken.value);
+  haOk.value = true;
+  haMsg.value = "已保存到本机浏览器";
+}
+
+async function testHa() {
+  saveHa();
+  haTesting.value = true;
+  haMsg.value = "";
+  try {
+    const list = await haPlayers();
+    haOk.value = true;
+    haMsg.value = list.length
+      ? `连上了：找到 ${list.length} 个播放器（${list.slice(0, 3).map((x) => x.name).join("、")}${list.length > 3 ? " 等" : ""}）`
+      : "连上了，但还没有播放器：HA 里要加 Music Assistant 或 DLNA / Chromecast 集成";
+  } catch (e) {
+    haOk.value = false;
+    haMsg.value = haHint(e);
+  } finally { haTesting.value = false; }
+}
 
 const THEMES = [
   { key: "light", label: "浅色", icon: Sun },
@@ -77,6 +107,26 @@ onMounted(async () => {
     </section>
 
     <section class="grp">
+      <h2>投屏（Home Assistant）</h2>
+      <div class="ha">
+        <input v-model="haUrl" placeholder="http://192.168.1.240:8123" inputmode="url" />
+        <input v-model="haToken" type="password" placeholder="长期访问令牌（Long-Lived Token）" />
+        <div class="haops">
+          <button class="ghost" @click="saveHa"><Check :size="14" />保存</button>
+          <button class="ghost" :disabled="haTesting" @click="testHa">
+            <Cast :size="14" />{{ haTesting ? "测试中…" : "测试连接" }}
+          </button>
+        </div>
+        <p v-if="haMsg" :class="haOk ? 'ok' : 'bad'">{{ haMsg }}</p>
+        <p class="note">
+          设备都在你家里、服务器在东京够不到，所以投屏要经你家 HA：HA 里的 <b>Music Assistant</b>
+          （或 DLNA / Chromecast 集成）把设备暴露出来，播放条上的投屏按钮就能把歌推过去。<br />
+          地址与令牌只存在你浏览器本地，不会发到服务器。HA 里生成令牌：个人资料 → 长期访问令牌。
+        </p>
+      </div>
+    </section>
+
+    <section class="grp">
       <h2>关于</h2>
       <div class="kv"><span>构建</span><b>{{ info.build || "—" }}</b></div>
       <div class="kv"><span>换源</span><b>{{ info.sources || "—" }}</b></div>
@@ -110,7 +160,12 @@ onMounted(async () => {
 .ghost { display: inline-flex; align-items: center; gap: 5px; padding: 6px 12px; border-radius: 14px;
          background: var(--fill); font-size: 12.5px; }
 .ghost:disabled { opacity: .5; }
-.ok { color: var(--acc); font-size: 12.5px; margin: 8px 0 0; }
+.ok { color: var(--acc); font-size: 12.5px; margin: 8px 0 0; white-space: pre-wrap; }
+.bad { color: #ff9f0a; font-size: 12.5px; margin: 8px 0 0; white-space: pre-wrap; line-height: 1.55; }
+.ha { display: flex; flex-direction: column; gap: 9px; max-width: 460px; }
+.ha input { padding: 10px 13px; border-radius: 10px; background: var(--fill); border: 0; outline: 0;
+            font-size: 13.5px; color: var(--fg); }
+.haops { display: flex; gap: 9px; flex-wrap: wrap; }
 .kv { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 0.5px solid var(--hair); font-size: 13.5px; }
 .kv b { color: var(--fg2); font-weight: 500; }
 .note { font-size: 12.5px; color: var(--fg2); line-height: 1.6; margin: 10px 0 0; }
