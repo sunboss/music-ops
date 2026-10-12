@@ -14,7 +14,7 @@ run_checks() {
   echo "===== $(date '+%F %T %Z') ====="
 
   # 1. 容器
-  for c in music-web music-enhancer music-api; do
+  for c in music-web music-enhancer music-api music-go-adapter; do
     if [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = "true" ]; then
       ok "容器 $c 运行中"
     else
@@ -93,6 +93,22 @@ except Exception as e:
     ok "磁盘 ${USED}%（剩 ${FREE}G）"
   fi
   ok "音频缓存 $(ls "$DIR/data/audio_cache" 2>/dev/null | wc -l) 首 / $(du -sh "$DIR/data/audio_cache" 2>/dev/null | cut -f1)"
+
+  # 8. 音频缓存 LRU 清理：>6GB 时按修改时间删最旧，回收到 4.5GB 以下
+  CACHE_BYTES=$(du -sb "$DIR/data/audio_cache" 2>/dev/null | cut -f1)
+  if [ "${CACHE_BYTES:-0}" -gt 6442450944 ]; then
+    REMOVED=$(cd "$DIR/data/audio_cache" && ls -tr | head -200 | xargs -r rm -f && echo done)
+    ok "LRU 清理已执行：缓存曾超 6GB，已删最旧 200 首（现 $(du -sh "$DIR/data/audio_cache" | cut -f1)）"
+  else
+    ok "缓存水位正常（$((CACHE_BYTES / 1073741824))GB / 6GB）"
+  fi
+
+  # 9. 每日摘要：日期变化时把当次结果存为 data/daily_summary.txt（供推读/告警）
+  TODAY=$(date +%F)
+  if [ ! -f "$DIR/data/.summary_day" ] || [ "$(cat "$DIR/data/.summary_day")" != "$TODAY" ]; then
+    echo "$TODAY" > "$DIR/data/.summary_day"
+    cp "$TMPOUT" "$DIR/data/daily_summary.txt" 2>/dev/null || true
+  fi
 
   if [ "$FAIL" -eq 0 ]; then
     echo "结论: 全部正常"
