@@ -293,6 +293,9 @@ def probe_duration(path):
 
 # 低于这个码率（字节/秒）在音乐里不现实，用于在解析不出时长时兜底判断
 MIN_BYTES_PER_SEC = 6000.0          # 约 48 kbps
+# 网易云「外链播放」地址：前端在取不到源时会拿它兜底，但它对 VIP 曲只返回 30 秒试听。
+# 我们把它也纳入候选，但必须经过体积/时长校验才采纳。
+NETEASE_OUTER = "https://music.163.com/song/media/outer/url?id="
 
 
 def duration_ok(path, expected):
@@ -558,9 +561,16 @@ class H(BaseHTTPRequestHandler):
         # 官方不可用 → 严格匹配换源
         res = go_resolve(name, artist, album, dur)
         if not res or not is_http(res.get("url")):
-            print("[Enhancer] 未换源，保持不可播放: %s / %s (原因: %s)"
-                  % (name, artist, (res or {}).get("attempts")))
-            # 官方可能给的是试听片段，绝不能回填（否则只能听 30 秒）
+            # 最后试网易云外链：体积够长才采纳（VIP 曲它只给 30 秒）
+            osz = measure_size(NETEASE_OUTER + urllib.parse.quote(sid))
+            if dur and osz >= dur * MIN_BYTES_PER_SEC:
+                entry = build_entry(sid, NETEASE_OUTER + urllib.parse.quote(sid), dur,
+                                    "netease-outer", size=osz)
+                print("[Enhancer] 外链可用且体积达标 %s / %s (%d 字节)" % (name, artist, osz))
+                return self._json(200, {"code": 200, "data": [entry]})
+            print("[Enhancer] 未换源，保持不可播放: %s / %s (原因: %s, 外链 %d 字节判为片段)"
+                  % (name, artist, (res or {}).get("attempts"), osz))
+            # 官方/外链可能给的是试听片段，绝不能回填（否则只能听 30 秒）
             return self._json(200, strip_trial(data) or {"code": 404, "data": []})
         try:
             entry = build_entry(sid, res["url"], dur, "fallback")
@@ -711,6 +721,10 @@ class H(BaseHTTPRequestHandler):
             elif not res or not is_http(fb):
                 print("[Enhancer] 换源无匹配 %s / %s: %s"
                       % (name, artist, (res or {}).get("attempts")))
+        outer = NETEASE_OUTER + urllib.parse.quote(sid)
+        if outer not in seen:
+            cands.append((outer, "netease-outer"))
+            seen.add(outer)
 
         up_url = ""
         rejected = 0

@@ -3,7 +3,7 @@
  * 仅保留：顶部导航栏品牌 Logo；并清除旧版 Service Worker 缓存，保证增强脚本生效
  */
 (function () {
-  window.__RM_VERSION = "20261012q";
+  window.__RM_VERSION = "20261012r";
 
   (async function killOldServiceWorker() {
     try {
@@ -129,6 +129,19 @@
     if (!op) return;
     HTMLMediaElement.prototype.play = function () {
       var a = this;
+      // 拦截网易云「外链兜底」：前端在取不到源时会播
+      // https://music.163.com/song/media/outer/url?id=xxx，它对 VIP 曲只给 30 秒试听。
+      // 改走我们自己的代理——由服务端解析完整音源并校验真实时长（拿不到就如实报无音源）。
+      try {
+        var cur = a.currentSrc || a.src || "";
+        var m = cur.match(/music\.163\.com\/song\/media\/outer\/url\?id=(\d+)/);
+        if (m) {
+          var fixed = "/api/audio/proxy?id=" + m[1];
+          a.src = fixed;
+          try { a.load(); } catch (e2) {}
+          report({kind: "rewrite", from: cur.slice(0, 90), to: fixed});
+        }
+      } catch (e3) {}
       var fire = function () {
         report({kind: "play", src: a.currentSrc || a.src || "", dur: a.duration || 0,
                 t: a.currentTime || 0});
