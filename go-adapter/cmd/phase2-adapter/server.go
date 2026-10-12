@@ -304,6 +304,25 @@ func handleResolveBest(w http.ResponseWriter, r *http.Request) {
 			rejected++
 		}
 		if picked == nil {
+			// 二次匹配：严格匹配（含时长容差）全部被拒时，对非 VIP/非 invalid
+			// 候选再跑一轮 matchLoose（歌名去标点全等 + 歌手兼容，不判时长——
+			// 同一录音各平台时长常差 10-30s）。仍不播放翻唱/Live/变速版：
+			// 歌名与歌手必须原样等价。
+			for i := range songs {
+				g := songs[i]
+				if g.IsInvalid || g.IsVIP {
+					continue
+				}
+				if matchLoose(want, g) == "" {
+					picked = &g
+					break
+				}
+			}
+			if picked != nil {
+				attempts = append(attempts, attempt{Source: src, Status: "loose_match(严格被拒后二次匹配,未判时长)"})
+			}
+		}
+		if picked == nil {
 			attempts = append(attempts, attempt{Source: src, Status: fmt.Sprintf("no_strict_match(%d候选被拒)", rejected)})
 			continue
 		}
