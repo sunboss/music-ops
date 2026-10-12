@@ -40,6 +40,7 @@ REJECT_MARK = "__REJECTED__"                          # 上游只有试听片段
 UA_BROWSER = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
 START_TS = int(time.time())
+# 构建标识会随本文件内容变化：客户端据此自动清理旧缓存并重载
 
 
 def _build_id():

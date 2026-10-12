@@ -3,7 +3,7 @@
  * 仅保留：顶部导航栏品牌 Logo；并清除旧版 Service Worker 缓存，保证增强脚本生效
  */
 (function () {
-  window.__RM_VERSION = "20261012n";
+  window.__RM_VERSION = "20261012q";
 
   (async function killOldServiceWorker() {
     try {
@@ -98,24 +98,110 @@
   }
   // 页面状态（含当前注册的 Service Worker，便于判断是否是旧版缓存）
   setTimeout(function () {
-    var info = {kind: "page", url: location.href, sw: ""};
-    if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
-      navigator.serviceWorker.getRegistrations().then(function (rs) {
-        info.sw = rs.map(function (r) { return (r.active && r.active.scriptURL) || "?"; }).join("|");
-        report(info);
-      }).catch(function () { report(info); });
-    } else { report(info); }
+    var info = {kind: "page", url: location.href, sw: "", ctrl: "", caches: ""};
+    var finish = function () { report(info); };
+    var jobs = [];
+    if (navigator.serviceWorker) {
+      info.ctrl = navigator.serviceWorker.controller
+        ? navigator.serviceWorker.controller.scriptURL : "(无控制器)";
+      if (navigator.serviceWorker.getRegistrations) {
+        jobs.push(navigator.serviceWorker.getRegistrations().then(function (rs) {
+          info.sw = rs.map(function (r) {
+            return [r.active && r.active.scriptURL, r.installing && "installing",
+                    r.waiting && "waiting"].filter(Boolean).join(",") || "?";
+          }).join(" | ") || "(无注册)";
+        }).catch(function () {}));
+      }
+    }
+    if (window.caches && caches.keys) {
+      jobs.push(caches.keys().then(function (ks) {
+        info.caches = ks.join(",") || "(空)";
+      }).catch(function () {}));
+    }
+    Promise.all(jobs).then(finish).catch(finish);
   }, 2500);
 
-  // 每次开始播放，回报实际地址与浏览器识别到的时长
-  document.addEventListener("play", function (e) {
-    var a = e.target;
-    if (!a || a.tagName !== "AUDIO") return;
-    var send = function () {
-      report({kind: "play", src: a.currentSrc || a.src || "", dur: a.duration || 0,
-              t: a.currentTime || 0});
+  // 每次开始播放，回报实际地址与浏览器识别到的时长。
+  // 注意：播放器的音频对象是 Howler 用 new Audio() 创建的，不挂在 DOM 上，
+  // 因此 document 上的 play 事件收不到 —— 必须挂钩 HTMLMediaElement.prototype.play。
+  (function () {
+    var op = HTMLMediaElement.prototype.play;
+    if (!op) return;
+    HTMLMediaElement.prototype.play = function () {
+      var a = this;
+      var fire = function () {
+        report({kind: "play", src: a.currentSrc || a.src || "", dur: a.duration || 0,
+                t: a.currentTime || 0});
+      };
+      if (a.duration) { setTimeout(fire, 800); }
+      else { a.addEventListener("loadedmetadata", function () { setTimeout(fire, 800); },
+                                {once: true}); }
+      return op.apply(this, arguments);
     };
-    if (a.duration) { send(); }
-    else { a.addEventListener("loadedmetadata", send, {once: true}); }
-  }, true);
+  })();
+})();
+
+/* 取源监控：把播放器每次请求 /song/url 拿到的内容回报给服务端。
+   关键用途：判断取源请求是否被 Service Worker 的旧缓存截住
+   （如果 App 收到了响应、而服务端访问日志里没有这条请求，就是缓存命中）。 */
+(function () {
+  function send(obj) {
+    try {
+      obj.v = window.__RM_VERSION;
+      obj.ua = navigator.userAgent;
+      var body = JSON.stringify(obj);
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon("/api/client-report", new Blob([body], {type: "application/json"}));
+      } else {
+        fetch("/api/client-report", {method: "POST", body: body, keepalive: true}).catch(function () {});
+      }
+    } catch (e) {}
+  }
+  window.__rmReport = send;
+
+  function summarize(data) {
+    try {
+      var d = (typeof data === "string") ? JSON.parse(data) : data;
+      var it = ((d && d.data) || [])[0] || {};
+      return "url=" + ((it.url || "null") + "").slice(0, 90) +
+             " size=" + (it.size || 0) + " br=" + (it.br || 0) +
+             " src=" + (it.source || d.source || "-") +
+             " trial=" + (it.freeTrialInfo ? "yes" : "no");
+    } catch (e) { return "解析失败"; }
+  }
+
+  // ---- fetch ----
+  var of = window.fetch;
+  if (of) {
+    window.fetch = function (input, init) {
+      var url = (input && input.url) || input || "";
+      var p = of.apply(this, arguments);
+      if (String(url).indexOf("/song/url") >= 0) {
+        p.then(function (r) {
+          r.clone().text().then(function (t) {
+            send({kind: "songurl", via: "fetch", req: String(url).slice(0, 100), res: summarize(t)});
+          }).catch(function () {});
+        }).catch(function () {});
+      }
+      return p;
+    };
+  }
+
+  // ---- XMLHttpRequest（axios 默认走这条） ----
+  var OX = window.XMLHttpRequest;
+  if (OX) {
+    var oOpen = OX.prototype.open, oSend = OX.prototype.send;
+    OX.prototype.open = function (m, u) { this.__rmUrl = u; return oOpen.apply(this, arguments); };
+    OX.prototype.send = function () {
+      var xhr = this;
+      if (String(xhr.__rmUrl || "").indexOf("/song/url") >= 0) {
+        xhr.addEventListener("load", function () {
+          var cached = xhr.getResponseHeader && xhr.getResponseHeader("age");
+          send({kind: "songurl", via: "xhr", req: String(xhr.__rmUrl).slice(0, 100),
+                status: xhr.status, res: summarize(xhr.responseText), age: cached || ""});
+        });
+      }
+      return oSend.apply(this, arguments);
+    };
+  }
 })();
