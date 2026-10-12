@@ -2709,6 +2709,10 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json;charset=utf-8")
         self._cors()
+        # 列表/元数据类只读接口：让 Cloudflare 边缘缓存 3 分钟（列表秒开）。
+        # 排除项：歌词（打轴实时性）与音源接口本身；AI/收藏/诊断在别的分支不会走到这。
+        if path not in ("/lyric",) and code == 200:
+            self.send_header("Cache-Control", "public, max-age=180, stale-while-revalidate=600")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self._wbody(body)
