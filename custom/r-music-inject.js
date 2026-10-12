@@ -3,7 +3,7 @@
  * 仅保留：顶部导航栏品牌 Logo；并清除旧版 Service Worker 缓存，保证增强脚本生效
  */
 (function () {
-  window.__RM_VERSION = "20261012t";
+  window.__RM_VERSION = "20261012u";
 
   (async function killOldServiceWorker() {
     try {
@@ -298,24 +298,29 @@
         '<div class="ar">' + (s.artist || "") + '</div></div>' +
         '<div class="du">' + m + ":" + (ss < 10 ? "0" : "") + ss + "</div>";
       it.onclick = function () { playInPanel(s.id, it); };
+      if (s.playable === false) {
+        // 服务端已探明没有完整音源：置灰并说明，避免点了没反应
+        it.style.opacity = "0.45";
+        it.onclick = function () { alert("这首歌暂时没有完整音源（各平台只有试听片段）"); };
+        var badge = document.createElement("div");
+        badge.className = "du"; badge.textContent = "无音源";
+        it.appendChild(badge);
+      } else if (s.playable === undefined) {
+        // 服务端没给标记时，前端补一次检查
+        (function (x) {
+          fetch("/api/song/url?id=" + x.id).then(function (r) { return r.json(); }).then(function (res) {
+            var t = ((res.data || [])[0] || {});
+            if (!t.url || t.source === "no-source") {
+              x.el.style.opacity = "0.45";
+              x.el.onclick = function () { alert("这首歌暂时没有可用音源"); };
+            }
+          }).catch(function () {});
+        })({el: it, id: s.id});
+      }
       box.appendChild(it);
       items.push({el: it, id: s.id});
     });
     if (!items.length) { box.innerHTML = '<div class="it">没找到合适的歌，换个说法试试</div>'; return; }
-
-    // 异步标注可用性：拿不到完整音源的置灰，避免点了没反应
-    items.forEach(function (x) {
-      fetch("/api/song/url?id=" + x.id).then(function (r) { return r.json(); }).then(function (res) {
-        var it = ((res.data || [])[0] || {});
-        if (!it.url || it.source === "no-source") {
-          x.el.style.opacity = "0.45";
-          x.el.onclick = function () { alert("这首歌暂时没有可用音源（各平台只有试听片段）"); };
-          var badge = document.createElement("div");
-          badge.className = "du"; badge.textContent = "无音源";
-          x.el.appendChild(badge);
-        }
-      }).catch(function () {});
-    });
   }
 
   function ask() {

@@ -107,6 +107,38 @@ def cache_get(sid):
     return None
 
 
+def _mark_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    c = sqlite3.connect(CACHE_DB)
+    c.execute("CREATE TABLE IF NOT EXISTS unplayable (song_id TEXT PRIMARY KEY, until REAL)")
+    return c
+
+
+UNPLAYABLE_TTL = 86400 * 3      # 登记 3 天内视为「无完整音源」，到期自动重试
+
+
+def mark_unplayable(sid):
+    """登记为「全网拿不到完整音源」，列表里保持灰色，避免用户反复点到空"""
+    try:
+        c = _mark_db()
+        c.execute("INSERT OR REPLACE INTO unplayable VALUES (?,?)",
+                  (str(sid), time.time() + UNPLAYABLE_TTL))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+def is_unplayable(sid):
+    try:
+        c = _mark_db()
+        row = c.execute("SELECT until FROM unplayable WHERE song_id=?", (str(sid),)).fetchone()
+        c.close()
+        return bool(row and row[0] and time.time() < row[0])
+    except Exception:
+        return False
+
+
 def cache_del(sid):
     try:
         c = _db()
@@ -266,6 +298,80 @@ def search_songs(keyword, limit=5):
                     "album": al.get("name") or "",
                     "duration": round((s.get("dt") or 0) / 1000.0, 1)})
     return out
+
+
+def quick_playable(sid):
+    """快速判断这首歌有没有「完整音源」，不下载整曲：
+    命中落盘缓存最准；否则看官方/换源直链的实际体积是否撑得起这首歌的时长。"""
+    sid = str(sid or "").strip()
+    if not sid:
+        return False
+    if audio_cached(sid):
+        return True
+    hit = cache_get(sid)
+    if hit:
+        return hit[0] != REJECT_MARK and bool(hit[0])
+    name, artist, album, dur = song_detail(sid)
+    for cand in (official_url(sid)[0], None):
+        if cand:
+            sz = measure_size(cand)
+            if dur and sz >= dur * MIN_BYTES_PER_SEC:
+                return True
+            break
+    if not name:
+        return False
+    res = go_resolve(name, artist, album, dur)
+    u = (res or {}).get("url")
+    if not is_http(u):
+        return False
+    sz = measure_size(u)
+    if dur and sz >= dur * MIN_BYTES_PER_SEC:
+        return True
+    return False
+
+
+# 翻唱/劣质变体特征词：仅用于降权排序，不做过滤（有正当歌曲含这些词）
+BAD_NAME_HINTS = ("翻唱", "cover", "伴奏", "remix", "dj版", "dj弹鼓", "深情版", "片段",
+                  "串烧", "铃声", "加速版", "减速版", "slowed", "sped up", "纯音乐版",
+                  "钢琴版", "吉他版", "口琴版", "教学", "跟唱")
+
+
+def bad_variant(name):
+    n = (name or "").lower()
+    return any(h in n for h in BAD_NAME_HINTS)
+
+
+def reorder_search_songs(songs):
+    """搜索列表降权：把翻唱/伴奏/片段等变体排到后面，原版优先。
+    稳定排序，不改变同名同类之间的原有相对顺序。"""
+    if not isinstance(songs, list) or len(songs) < 2:
+        return songs
+    try:
+        return sorted(songs, key=lambda s: 1 if bad_variant((s or {}).get("name")) else 0)
+    except Exception:
+        return songs
+
+
+def rank_songs(songs, plan):
+    """按「与需求的吻合度」排序：指定歌手命中优先，其次歌名关键词命中，最后时长较长者"""
+    artist = (plan.get("artist") or "").strip().lower()
+    kws = [k.strip().lower() for k in (plan.get("keywords") or []) if k.strip()]
+
+    def score(s):
+        sc = 0
+        if artist and artist in (s.get("artist") or "").lower():
+            sc -= 100                       # 命中指定歌手，最优先
+        nm = (s.get("name") or "").lower()
+        for k in kws:
+            for w in k.split():
+                if len(w) >= 2 and w in nm:
+                    sc -= 5
+                    break
+        if bad_variant(nm):
+            sc += 30                        # 翻唱/伴奏/片段等变体降权
+        return sc
+
+    return sorted(songs, key=score)
 
 
 def is_http(u):
@@ -526,6 +632,12 @@ def clean_song_title(title):
 def ungrey_song(s):
     if not isinstance(s, dict):
         return
+    # 已知拿不到完整音源的曲目：保持灰色，让列表如实反映「不能播」
+    try:
+        if s.get("id") and is_unplayable(s.get("id")):
+            return
+    except Exception:
+        pass
     if s.get("fee") in (1, 4, 8):
         s["fee"] = 0
     if s.get("noCopyrightRcmd"):
@@ -625,6 +737,7 @@ class H(BaseHTTPRequestHandler):
             if hit and hit[0] == REJECT_MARK:
                 # 各来源都只有试听片段：仍然返回我们自己的地址（播放时会明确失败），
                 # 绝不返回 null —— 否则播放器会回落到网易云外链，只能听 30 秒
+                mark_unplayable(sid)
                 return self._json(200, {"code": 200, "data": [self._item(sid, 0, 0, "no-source")]})
             if hit:
                 _, size, br, src = hit
@@ -671,8 +784,9 @@ class H(BaseHTTPRequestHandler):
                 print("[Enhancer] 外链可用且体积达标 %s / %s (%d 字节)" % (name, artist, osz))
                 return self._json(200, {"code": 200, "data": [entry]})
             print("[Enhancer] 未换到完整音源: %s / %s (原因: %s, 外链 %d 字节判为片段) "
-                  "→ 仍返回自有代理地址，避免播放器回落网易云外链(30秒试听)"
+                  "→ 登记为无音源，列表保持灰色"
                   % (name, artist, (res or {}).get("attempts"), osz))
+            mark_unplayable(sid)
             return self._json(200, {"code": 200, "data": [self._item(sid, 0, 0, "no-source")]})
         try:
             entry = build_entry(sid, res["url"], dur, "fallback")
@@ -714,17 +828,32 @@ class H(BaseHTTPRequestHandler):
             print("[Enhancer] AI 解析失败: %s" % e)
             return self._json(502, {"error": "AI 解析失败: %s" % str(e)[:160]})
 
-        songs, seen = [], set()
+        # 多关键词取候选 -> 按吻合度排序 -> 并发探活 -> 只交付能完整播放的
+        cand, seen = [], set()
         for kw in plan["keywords"]:
             for s in search_songs(kw, plan["count"]):
-                if s["id"] and s["id"] not in seen:
+                if s.get("id") and s["id"] not in seen:
                     seen.add(s["id"])
-                    songs.append(s)
-            if len(songs) >= plan["count"]:
-                break
-        songs = songs[:plan["count"]]
-        print("[Enhancer] AI 点歌 %r -> 关键词 %s, 返回 %d 首" % (text[:24], plan["keywords"], len(songs)))
-        return self._json(200, {"reply": plan.get("reply") or "", "plan": plan, "songs": songs})
+                    cand.append(s)
+        cand = rank_songs(cand, plan)
+
+        import concurrent.futures as cf
+        with cf.ThreadPoolExecutor(max_workers=6) as ex:
+            flags = list(ex.map(lambda s: quick_playable(s["id"]), cand[:24]))
+        for s, ok in zip(cand[:24], flags):
+            s["playable"] = bool(ok)
+
+        playable = [s for s in cand[:24] if s["playable"]]
+        songs = (playable or cand)[:plan["count"]]
+        print("[Enhancer] AI 点歌 %r -> 关键词 %s, 候选 %d, 可播 %d, 交付 %d 首"
+              % (text[:24], plan["keywords"], len(cand), len(playable), len(songs)))
+        reply = plan.get("reply") or ""
+        if playable:
+            reply += "（%d 首可完整播放）" % len(playable)
+        else:
+            reply += "（这些暂时只有试听片段，可能无法完整播放）"
+        return self._json(200, {"reply": reply, "plan": plan, "songs": songs,
+                                "playable_count": len(playable)})
 
     # ------------------------------------------------------------ 单曲诊断
     def handle_debug_song(self, query):
@@ -883,6 +1012,7 @@ class H(BaseHTTPRequestHandler):
         if rejected and rejected >= len(cands):
             # 所有来源拿到的都是试听片段：标记不可播放，避免反复重试
             cache_set(sid, REJECT_MARK, 0, 0)
+            mark_unplayable(sid)
         if not up_url:
             self.send_response(404)
             self.send_header("Content-Length", "0")
@@ -946,6 +1076,11 @@ class H(BaseHTTPRequestHandler):
         try:
             data = json.loads(body.decode("utf-8"))
             ungrey_walk(data)
+            # 搜索列表：把翻唱/伴奏/片段等变体排到后面，原版优先
+            if path in ("/search", "/cloudsearch"):
+                res = data.get("result")
+                if isinstance(res, dict) and isinstance(res.get("songs"), list):
+                    res["songs"] = reorder_search_songs(res["songs"])
             body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         except Exception:
             pass
