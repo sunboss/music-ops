@@ -3,7 +3,7 @@
  * 仅保留：顶部导航栏品牌 Logo；并清除旧版 Service Worker 缓存，保证增强脚本生效
  */
 (function () {
-  window.__RM_VERSION = "20261012u";
+  window.__RM_VERSION = "20261012v";
 
   (async function killOldServiceWorker() {
     try {
@@ -219,123 +219,194 @@
   }
 })();
 
-/* AI 点歌浮窗：直接用一句话点歌（服务端 /api/ai/query 调用大模型解析需求） */
+/* AI 音乐面板：一句话点歌 / 生成电台歌单，面板内连续播放（自动下一首、失败自动跳过） */
 (function () {
   if (window.__rmAI || document.getElementById("rm-ai-btn")) return;
   window.__rmAI = true;
+
+  var SCENES = ["深夜写代码", "开车兜风", "运动健身", "专注学习", "助眠放松", "心情不好"];
+  var Q = {list: [], i: -1, busy: false};
 
   var css = document.createElement("style");
   css.textContent = [
     "#rm-ai-btn{position:fixed;right:18px;bottom:104px;z-index:9998;padding:10px 16px;border-radius:22px;",
     "background:linear-gradient(135deg,#00F2FE,#7F00FF);color:#fff;font:600 14px/1 -apple-system,'PingFang SC',sans-serif;",
     "cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.35);user-select:none}",
-    "#rm-ai-panel{position:fixed;right:18px;bottom:150px;z-index:9999;width:min(92vw,380px);max-height:70vh;",
+    "#rm-ai-panel{position:fixed;right:18px;bottom:150px;z-index:9999;width:min(94vw,400px);max-height:76vh;",
     "background:rgba(24,26,32,.97);color:#e8eef6;border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.5);",
     "display:none;flex-direction:column;overflow:hidden;font:14px/1.6 -apple-system,'PingFang SC',sans-serif}",
     "#rm-ai-panel .hd{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;",
     "font-weight:600;background:rgba(255,255,255,.06)}",
     "#rm-ai-panel .hd span{cursor:pointer;opacity:.7;font-size:18px;line-height:1;padding:0 4px}",
-    "#rm-ai-panel .bd{padding:12px 14px;display:flex;gap:8px}",
+    "#rm-ai-panel .bd{padding:10px 14px 6px;display:flex;gap:8px}",
     "#rm-ai-input{flex:1;min-width:0;padding:9px 12px;border-radius:9px;border:1px solid rgba(255,255,255,.18);",
     "background:rgba(255,255,255,.08);color:#fff;font-size:14px;outline:none}",
-    "#rm-ai-go{padding:9px 14px;border:0;border-radius:9px;background:#4FACFE;color:#fff;font-weight:600;cursor:pointer;white-space:nowrap}",
-    "#rm-ai-reply{padding:0 14px 8px;font-size:13px;opacity:.9}",
-    "#rm-ai-list{overflow:auto;padding:0 8px 10px}",
+    "#rm-ai-go{padding:9px 13px;border:0;border-radius:9px;background:#4FACFE;color:#fff;font-weight:600;cursor:pointer;white-space:nowrap}",
+    "#rm-ai-go.radio{background:#7F00FF}",
+    "#rm-ai-chips{padding:0 14px 6px;display:flex;flex-wrap:wrap;gap:6px}",
+    "#rm-ai-chips i{padding:3px 8px;border-radius:11px;background:rgba(255,255,255,.09);font-size:12px;",
+    "font-style:normal;cursor:pointer}",
+    "#rm-ai-chips i:hover{background:rgba(255,255,255,.2)}",
+    "#rm-ai-now{padding:7px 14px;font-size:12.5px;background:rgba(79,172,254,.16);display:none}",
+    "#rm-ai-reply{padding:2px 14px 6px;font-size:13px;opacity:.9}",
+    "#rm-ai-list{overflow:auto;padding:0 8px 8px;flex:1}",
     "#rm-ai-list .it{padding:8px 10px;border-radius:9px;cursor:pointer;display:flex;justify-content:space-between;gap:8px}",
     "#rm-ai-list .it:hover{background:rgba(255,255,255,.09)}",
+    "#rm-ai-list .it.on{background:rgba(79,172,254,.22)}",
     "#rm-ai-list .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
     "#rm-ai-list .ar{font-size:12px;opacity:.65}",
     "#rm-ai-list .du{font-size:12px;opacity:.6;flex:none}",
+    "#rm-ai-ctl{display:none;align-items:center;gap:10px;padding:8px 14px 4px;border-top:1px solid rgba(255,255,255,.08)}",
+    "#rm-ai-ctl b{cursor:pointer;font-size:17px;font-weight:400;padding:0 6px;user-select:none}",
+    "#rm-ai-ctl b:hover{opacity:.7}",
     "#rm-ai-audio{display:none;width:calc(100% - 28px);margin:0 14px 12px}"
   ].join("");
   document.head.appendChild(css);
 
   var btn = document.createElement("div");
-  btn.id = "rm-ai-btn"; btn.textContent = "AI 点歌";
+  btn.id = "rm-ai-btn"; btn.textContent = "AI 音乐";
   var panel = document.createElement("div");
   panel.id = "rm-ai-panel";
   panel.innerHTML =
-    '<div class="hd">AI 点歌<span id="rm-ai-x">&times;</span></div>' +
-    '<div class="bd"><input id="rm-ai-input" placeholder="说一句，例如：适合深夜写代码的">' +
+    '<div class="hd"><span style="cursor:default;font-weight:600">AI 音乐<span id="rm-ai-title" ' +
+    'style="font-weight:400;opacity:.7;font-size:12px;margin-left:8px"></span></span>' +
+    '<span id="rm-ai-x">&times;</span></div>' +
+    '<div class="bd"><input id="rm-ai-input" placeholder="说一句，例如：深夜写代码听的">' +
     '<button id="rm-ai-go">点歌</button></div>' +
-    '<div id="rm-ai-reply"></div><div id="rm-ai-list"></div>' +
+    '<div id="rm-ai-chips"></div>' +
+    '<div id="rm-ai-reply"></div><div id="rm-ai-now"></div>' +
+    '<div id="rm-ai-list"></div>' +
+    '<div id="rm-ai-ctl"><b id="rm-ai-prev">&#9198;</b><b id="rm-ai-play">&#9208;</b>' +
+    '<b id="rm-ai-next">&#9197;</b><span id="rm-ai-pos" style="font-size:12px;opacity:.65"></span></div>' +
     '<audio id="rm-ai-audio" controls preload="none"></audio>';
   document.body.appendChild(btn);
   document.body.appendChild(panel);
 
-  function playInPanel(id, el) {
-    var a = document.getElementById("rm-ai-audio");
-    // 暂停站点自带播放器，避免两个声音同时响
+  var audio = document.getElementById("rm-ai-audio");
+  var nowEl = document.getElementById("rm-ai-now");
+  var posEl = document.getElementById("rm-ai-pos");
+  var listEl = document.getElementById("rm-ai-list");
+  var repEl = document.getElementById("rm-ai-reply");
+
+  document.getElementById("rm-ai-chips").innerHTML = SCENES.map(function (s) {
+    return "<i>" + s + "</i>";
+  }).join("");
+  Array.prototype.forEach.call(document.querySelectorAll("#rm-ai-chips i"), function (el) {
+    el.onclick = function () {
+      document.getElementById("rm-ai-input").value = el.textContent;
+      ask("radio");
+    };
+  });
+
+  function quietOthers() {
     try {
       Array.prototype.forEach.call(document.querySelectorAll("audio"), function (x) {
-        if (x !== a) { x.pause(); }
+        if (x !== audio) x.pause();
       });
     } catch (e) {}
-    document.getElementById("rm-ai-reply").textContent = "取源中…";
-    fetch("/api/song/url?id=" + id).then(function (r) { return r.json(); }).then(function (d) {
-      var it = ((d.data || [])[0] || {});
-      if (!it.url || it.source === "no-source") {
-        document.getElementById("rm-ai-reply").textContent = "这首歌暂时没有完整音源";
-        setTimeout(function () { if (el) el.style.opacity = "0.45"; }, 0);
-        return;
-      }
-      a.src = it.url; a.style.display = "block"; a.play().catch(function () {});
-      document.getElementById("rm-ai-reply").textContent = "正在播放" +
-        (it.size ? "（完整音频 " + (it.size / 1024 / 1024).toFixed(1) + " MB）" : "");
-    });
   }
 
-  function render(d) {
-    document.getElementById("rm-ai-reply").textContent = d.reply || "";
-    var box = document.getElementById("rm-ai-list");
-    box.innerHTML = "";
-    var items = [];
-    (d.songs || []).forEach(function (s) {
+  function draw() {
+    listEl.innerHTML = "";
+    Q.list.forEach(function (s, i) {
       var it = document.createElement("div");
-      it.className = "it";
+      it.className = "it" + (i === Q.i ? " on" : "");
       var m = Math.floor(s.duration / 60), ss = Math.round(s.duration % 60);
       it.innerHTML = '<div class="nm">' + (s.name || "") +
         '<div class="ar">' + (s.artist || "") + '</div></div>' +
-        '<div class="du">' + m + ":" + (ss < 10 ? "0" : "") + ss + "</div>";
-      it.onclick = function () { playInPanel(s.id, it); };
+        '<div class="du">' + (i === Q.i ? "▶ " : "") + m + ":" + (ss < 10 ? "0" : "") + ss + "</div>";
       if (s.playable === false) {
-        // 服务端已探明没有完整音源：置灰并说明，避免点了没反应
-        it.style.opacity = "0.45";
-        it.onclick = function () { alert("这首歌暂时没有完整音源（各平台只有试听片段）"); };
-        var badge = document.createElement("div");
-        badge.className = "du"; badge.textContent = "无音源";
-        it.appendChild(badge);
-      } else if (s.playable === undefined) {
-        // 服务端没给标记时，前端补一次检查
-        (function (x) {
-          fetch("/api/song/url?id=" + x.id).then(function (r) { return r.json(); }).then(function (res) {
-            var t = ((res.data || [])[0] || {});
-            if (!t.url || t.source === "no-source") {
-              x.el.style.opacity = "0.45";
-              x.el.onclick = function () { alert("这首歌暂时没有可用音源"); };
-            }
-          }).catch(function () {});
-        })({el: it, id: s.id});
+        it.style.opacity = ".45";
+        it.title = "这首歌暂时没有完整音源";
       }
-      box.appendChild(it);
-      items.push({el: it, id: s.id});
+      it.onclick = function () {
+        if (s.playable === false) { alert("这首歌暂时没有完整音源（各平台只有试听片段）"); return; }
+        playAt(i);
+      };
+      listEl.appendChild(it);
     });
-    if (!items.length) { box.innerHTML = '<div class="it">没找到合适的歌，换个说法试试</div>'; return; }
   }
 
-  function ask() {
+  function markDead(i) {
+    if (Q.list[i]) { Q.list[i].playable = false; }
+    draw();
+  }
+
+  function playAt(i) {
+    if (i < 0 || i >= Q.list.length) { nowEl.textContent = "歌单播完了"; return; }
+    Q.i = i; draw();
+    var s = Q.list[i];
+    nowEl.style.display = "block";
+    nowEl.textContent = "加载中：" + s.name + " - " + s.artist;
+    document.getElementById("rm-ai-ctl").style.display = "flex";
+    fetch("/api/song/url?id=" + s.id).then(function (r) { return r.json(); }).then(function (d) {
+      var t = ((d.data || [])[0] || {});
+      if (!t.url || t.source === "no-source") {
+        markDead(i); nowEl.textContent = "这首没有完整音源，自动跳过";
+        setTimeout(function () { playAt(i + 1); }, 600);
+        return;
+      }
+      quietOthers();
+      audio.src = t.url;
+      audio.style.display = "block";
+      audio.play().catch(function () {});
+      nowEl.textContent = "正在播放：" + s.name + " - " + s.artist;
+    }).catch(function () { markDead(i); setTimeout(function () { playAt(i + 1); }, 600); });
+  }
+
+  audio.addEventListener("ended", function () { playAt(Q.i + 1); });
+  audio.addEventListener("error", function () {
+    if (!audio.src) return;
+    markDead(Q.i);
+    setTimeout(function () { playAt(Q.i + 1); }, 600);
+  });
+  audio.addEventListener("timeupdate", function () {
+    if (!audio.duration) return;
+    var f = function (t) { var m = Math.floor(t / 60), s = Math.floor(t % 60);
+      return m + ":" + (s < 10 ? "0" : "") + s; };
+    posEl.textContent = f(audio.currentTime) + " / " + f(audio.duration) +
+      (Q.list.length ? "  (" + (Q.i + 1) + "/" + Q.list.length + ")" : "");
+  });
+
+  document.getElementById("rm-ai-prev").onclick = function () { playAt(Math.max(0, Q.i - 1)); };
+  document.getElementById("rm-ai-next").onclick = function () { playAt(Q.i + 1); };
+  document.getElementById("rm-ai-play").onclick = function () {
+    if (audio.paused) { audio.play().catch(function () {}); } else { audio.pause(); }
+  };
+
+  function ask(mode) {
     var q = (document.getElementById("rm-ai-input").value || "").trim();
-    if (!q) return;
-    var rep = document.getElementById("rm-ai-reply"), box = document.getElementById("rm-ai-list");
-    rep.textContent = "想一下…"; box.innerHTML = "";
-    fetch("/api/ai/query", {method: "POST", headers: {"Content-Type": "application/json"},
-                            body: JSON.stringify({q: q})})
+    if (!q || Q.busy) return;
+    Q.busy = true;
+    var radio = mode === "radio";
+    var goEl = document.getElementById("rm-ai-go");
+    goEl.textContent = radio ? "生成中…" : "想一下…";
+    repEl.textContent = radio ? "正在为你编排歌单（约需 10-30 秒）…" : "想一下…";
+    listEl.innerHTML = "";
+    document.getElementById("rm-ai-title").textContent = "";
+    fetch(radio ? "/api/ai/radio" : "/api/ai/query",
+          {method: "POST", headers: {"Content-Type": "application/json"},
+           body: JSON.stringify({q: q, count: 15})})
       .then(function (r) { return r.json(); })
       .then(function (d) {
-        if (d.error) { rep.textContent = d.error; return; }
-        render(d);
+        Q.busy = false;
+        goEl.textContent = radio ? "电台" : "点歌";
+        if (d.error) { repEl.textContent = d.error; return; }
+        if (d.title) document.getElementById("rm-ai-title").textContent = d.title;
+        var n = (d.songs || []).filter(function (s) { return s.playable !== false; }).length;
+        repEl.textContent = (d.reply || "") + (radio ? "　共 " + n + " 首可播" : "");
+        Q.list = d.songs || []; Q.i = -1;
+        draw();
+        if (radio && Q.list.length) {
+          var first = Q.list.findIndex(function (s) { return s.playable !== false; });
+          playAt(first < 0 ? 0 : first);
+        }
       })
-      .catch(function (e) { rep.textContent = "请求失败：" + e; });
+      .catch(function (e) {
+        Q.busy = false;
+        goEl.textContent = radio ? "电台" : "点歌";
+        repEl.textContent = "请求失败：" + e;
+      });
   }
 
   btn.onclick = function () {
@@ -343,11 +414,9 @@
     if (panel.style.display === "flex") document.getElementById("rm-ai-input").focus();
   };
   document.getElementById("rm-ai-x").onclick = function () { panel.style.display = "none"; };
-  document.getElementById("rm-ai-audio").addEventListener("error", function () {
-    document.getElementById("rm-ai-reply").textContent = "这首歌暂时无法播放（可能没有完整音源）";
-  });
-  document.getElementById("rm-ai-go").onclick = ask;
+  document.getElementById("rm-ai-go").onclick = function () { ask("song"); };
+  document.getElementById("rm-ai-go").ondblclick = function () { ask("radio"); };
   document.getElementById("rm-ai-input").addEventListener("keydown", function (e) {
-    if (e.key === "Enter") ask();
+    if (e.key === "Enter") { ask(e.shiftKey ? "radio" : "song"); }
   });
 })();

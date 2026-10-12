@@ -265,6 +265,26 @@ def _strip_fence(s):
     return t.strip()
 
 
+RADIO_PROMPT = (
+    "你是音乐电台策划。根据用户描述生成一张歌单的检索计划（只输出 JSON，不要解释）：\n"
+    '{"title":"歌单名(10字内)","reply":"一句中文回复",'
+    '"keywords":["检索词1","检索词2",...]}\n'
+    "要求：keywords 给 6-8 个不同角度但都贴合需求的检索词（歌手名、代表作、风格词、场景词混合），"
+    "每个都要具体到能在音乐平台搜到歌，不要整句描述。")
+
+
+def ai_radio_plan(text):
+    """让大模型产出电台检索计划（多关键词，用于凑出一整张歌单）"""
+    out = ai_chat([{"role": "system", "content": RADIO_PROMPT},
+                   {"role": "user", "content": text}], temperature=0.6)
+    plan = json.loads(_strip_fence(out))
+    kws = [str(k) for k in (plan.get("keywords") or []) if str(k).strip()]
+    if not kws:
+        kws = [text]
+    plan["keywords"] = kws[:8]
+    return plan
+
+
 def ai_plan(text):
     """让大模型把自然语言变成结构化检索条件"""
     out = ai_chat([{"role": "system", "content": PLAN_PROMPT},
@@ -300,6 +320,31 @@ def search_songs(keyword, limit=5):
     return out
 
 
+def probe_cache_get(sid):
+    try:
+        c = sqlite3.connect(CACHE_DB)
+        c.execute("CREATE TABLE IF NOT EXISTS probeable (song_id TEXT PRIMARY KEY, ok INT, until REAL)")
+        row = c.execute("SELECT ok, until FROM probeable WHERE song_id=?", (str(sid),)).fetchone()
+        c.close()
+        if row and row[1] and time.time() < row[1]:
+            return bool(row[0])
+    except Exception:
+        pass
+    return None
+
+
+def probe_cache_set(sid, ok):
+    try:
+        c = sqlite3.connect(CACHE_DB)
+        c.execute("CREATE TABLE IF NOT EXISTS probeable (song_id TEXT PRIMARY KEY, ok INT, until REAL)")
+        c.execute("INSERT OR REPLACE INTO probeable VALUES (?,?,?)",
+                  (str(sid), 1 if ok else 0, time.time() + 21600))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
 def quick_playable(sid):
     """快速判断这首歌有没有「完整音源」，不下载整曲：
     命中落盘缓存最准；否则看官方/换源直链的实际体积是否撑得起这首歌的时长。"""
@@ -307,7 +352,17 @@ def quick_playable(sid):
     if not sid:
         return False
     if audio_cached(sid):
+        probe_cache_set(sid, True)
         return True
+    cached = probe_cache_get(sid)
+    if cached is not None:
+        return cached
+    ok = _quick_playable_uncached(sid)
+    probe_cache_set(sid, ok)
+    return ok
+
+
+def _quick_playable_uncached(sid):
     hit = cache_get(sid)
     if hit:
         return hit[0] != REJECT_MARK and bool(hit[0])
@@ -804,13 +859,79 @@ class H(BaseHTTPRequestHandler):
                 "freeTrialInfo": None, "level": None, "source": source or "fallback",
                 "expi": CACHE_TTL}
 
+    def _ai_collect(self, keywords, want, per_kw=8, limit=20):
+        """按关键词批量取候选 -> 重排 -> 并发探活，返回（可播列表, 全部候选）"""
+        cand, seen = [], set()
+        for kw in keywords:
+            for s in search_songs(kw, per_kw):
+                if s.get("id") and s["id"] not in seen:
+                    seen.add(s["id"])
+                    cand.append(s)
+        cand = rank_songs(cand, {"artist": want.get("artist", ""), "keywords": keywords})
+        import concurrent.futures as cf
+        pool = cand[:72]
+        playable, keys = [], set()
+        t0 = time.time()
+        ex = cf.ThreadPoolExecutor(max_workers=16)
+        try:
+            futs = {ex.submit(quick_playable, s["id"]): s for s in pool}
+            for f in cf.as_completed(futs):
+                s = futs[f]
+                try:
+                    ok = f.result()
+                except Exception:
+                    ok = False
+                s["playable"] = bool(ok)
+                k = ((s.get("name") or "").lower().strip(), (s.get("artist") or "").lower().strip())
+                if ok and k not in keys:          # 同名同歌手只保留一首
+                    keys.add(k)
+                    playable.append(s)
+                    if len(playable) >= limit:
+                        break
+                if time.time() - t0 > 30 and len(playable) >= 5:
+                    print("[Enhancer] 探活超 30 秒，先交付已确认的 %d 首" % len(playable))
+                    break                          # 时间预算：不让用户等太久
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+        return playable[:limit], cand
+
+    # ------------------------------------------------------------ AI 电台/歌单
+    def handle_ai_radio(self, text, want=18):
+        """一句话生成整张歌单：多关键词检索 + 探活，只交付能完整播放的"""
+        try:
+            plan = ai_radio_plan(text)
+        except Exception as e:
+            print("[Enhancer] AI 电台解析失败: %s" % e)
+            return self._json(502, {"error": "AI 解析失败: %s" % str(e)[:160]})
+        songs, _ = self._ai_collect(plan["keywords"], plan, per_kw=8, limit=want)
+        if len(songs) < min(8, want):
+            # 不够就再要一轮关键词（最多补一次，避免无限循环）
+            try:
+                more = ai_radio_plan(text + "（再给 6 个不同的检索词，避免与上面重复）")
+                extra, _ = self._ai_collect(more["keywords"], plan, per_kw=8,
+                                            limit=want - len(songs))
+                have = {s["id"] for s in songs}
+                songs += [s for s in extra if s["id"] not in have]
+            except Exception as e:
+                print("[Enhancer] AI 电台补词失败: %s" % e)
+        print("[Enhancer] AI 电台 %r -> %d 首可播（关键词 %d 个）"
+              % (text[:24], len(songs), len(plan["keywords"])))
+        return self._json(200, {"title": plan.get("title") or "AI 电台",
+                                "reply": plan.get("reply") or "",
+                                "plan": {"keywords": plan["keywords"]},
+                                "songs": songs[:want], "playable_count": len(songs[:want])})
+
     # ------------------------------------------------------------ AI 点歌
     def handle_ai_query(self, query, body=None):
         """自然语言点歌：大模型把一句话变成检索条件 -> 官方搜索 -> 返回可点播的歌曲列表"""
         text = ""
+        want = 0
         if body:
             try:
-                text = (json.loads(body.decode("utf-8", "ignore")) or {}).get("q", "")
+                b = json.loads(body.decode("utf-8", "ignore")) or {}
+                text = b.get("q", "")
+                if b.get("mode") == "radio":
+                    want = int(b.get("count") or 18)
             except Exception:
                 text = ""
         if not text:
@@ -822,6 +943,8 @@ class H(BaseHTTPRequestHandler):
         if not ai_enabled():
             return self._json(503, {"error": "AI 未配置：请在服务端设置 AI_API_KEY（大模型网关 token）",
                                     "gateway": AI_GATEWAY, "model": AI_MODEL})
+        if want:
+            return self.handle_ai_radio(text, min(30, max(5, want)))
         try:
             plan = ai_plan(text)
         except Exception as e:
@@ -1115,6 +1238,14 @@ class H(BaseHTTPRequestHandler):
             return self.handle_debug_song(p.query)
         if real == "/ai/query":
             return self.handle_ai_query(p.query)
+        if real == "/ai/radio":
+            qs = urllib.parse.parse_qs(p.query or "")
+            q = (qs.get("q", [""])[0] or "").strip()
+            try:
+                want = int(qs.get("count", ["18"])[0])
+            except Exception:
+                want = 18
+            return self.handle_ai_radio(q, min(30, max(5, want)))
         return self.proxy_upstream(real, p.query)
 
     def do_POST(self):
@@ -1125,6 +1256,17 @@ class H(BaseHTTPRequestHandler):
         if real == "/ai/query":
             ln = int(self.headers.get("Content-Length", 0) or 0)
             return self.handle_ai_query(p.query, self.rfile.read(ln) if ln else b"")
+        if real == "/ai/radio":
+            ln = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                d = json.loads((self.rfile.read(ln) if ln else b"{}").decode("utf-8", "ignore")) or {}
+            except Exception:
+                d = {}
+            try:
+                want = int(d.get("count") or 18)
+            except Exception:
+                want = 18
+            return self.handle_ai_radio((d.get("q") or "").strip(), min(30, max(5, want)))
         return self.proxy_upstream(real, p.query)
 
     def handle_client_report(self):
