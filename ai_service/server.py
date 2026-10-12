@@ -19,6 +19,7 @@ import re
 import json
 import threading
 import io
+import shutil
 import http.client
 import time
 import sqlite3
@@ -648,6 +649,63 @@ def referer_allowed(handler):
     return any(a.strip() and a.strip() in host for a in ALLOWED_REFERERS)
 
 
+RECHECK_EVERY = int(os.getenv("RECHECK_EVERY", "1800"))    # 每 30 分钟复核一批
+RECHECK_BATCH = int(os.getenv("RECHECK_BATCH", "3"))
+
+
+def unplayable_expiring(limit):
+    """挑最快到期的几条「无音源」记录来复核（越接近到期越该重试）"""
+    try:
+        c = _mark_db()
+        rows = c.execute("SELECT song_id, until FROM unplayable ORDER BY until ASC LIMIT ?",
+                         (limit,)).fetchall()
+        c.close()
+        return [r[0] for r in rows if r[0]]
+    except Exception:
+        return []
+
+
+def recheck_worker():
+    """后台主动复核：以前判为「全网无完整音源」的歌，定期重新探一次。
+    平台补上版权后能自动恢复可播，不需要人工介入。"""
+    while True:
+        try:
+            time.sleep(RECHECK_EVERY)
+            ids = unplayable_expiring(RECHECK_BATCH)
+            if not ids:
+                continue
+            print("[Enhancer] 主动复核 %d 首无音源曲目: %s" % (len(ids), ids))
+            for sid in ids:
+                try:
+                    # 清掉旧的否定判定，否则复核会命中缓存直接返回 False
+                    cache_del(sid)
+                    c = sqlite3.connect(CACHE_DB)
+                    c.execute("DELETE FROM probeable WHERE song_id=?", (str(sid),))
+                    c.commit()
+                    c.close()
+                    if quick_playable(sid):
+                        clear_unplayable(sid)
+                        print("[Enhancer] 复核发现已可播，恢复显示: %s" % sid)
+                        prewarm_song(sid)
+                    else:
+                        mark_unplayable(sid)      # 续期，过段时间再试
+                except Exception as e:
+                    print("[Enhancer] 复核异常 %s: %s" % (sid, str(e)[:60]))
+        except Exception as e:
+            print("[Enhancer] 复核线程异常: %s" % str(e)[:80])
+
+
+def clear_unplayable(sid):
+    """解除「无音源」标记，让列表重新点亮"""
+    try:
+        c = _mark_db()
+        c.execute("DELETE FROM unplayable WHERE song_id=?", (str(sid),))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
 def prewarm_song(sid):
     """后台把一首歌解析并落盘，让用户点下去几乎立刻能响"""
     sid = str(sid or "").strip()
@@ -1181,20 +1239,87 @@ def audio_ext(ctype, url):
     return ".mp3"
 
 
-def evict_audio():
-    """按最近使用时间保留最近 AUDIO_MAX_FILES 首，避免磁盘无限增长"""
+AUDIO_MAX_BYTES = int(os.getenv("AUDIO_MAX_BYTES", str(2 * 1024 ** 3)))   # 缓存体积上限 2GB
+DISK_FREE_MIN_GB = float(os.getenv("DISK_FREE_MIN_GB", "8"))              # 剩余空间低于此值就狠清
+DISK_CHECK_EVERY = 300                                                    # 最快 5 分钟检查一次磁盘
+
+
+def disk_usage(path=DATA_DIR):
     try:
-        fs = [os.path.join(AUDIO_DIR, f) for f in os.listdir(AUDIO_DIR) if f.endswith(AUDIO_EXTS)]
-        if len(fs) <= AUDIO_MAX_FILES:
-            return
+        u = shutil.disk_usage(path)
+        return {"total_gb": u.total / 1e9, "free_gb": u.free / 1e9,
+                "used_pct": (u.used / u.total) * 100 if u.total else 0}
+    except Exception:
+        return {"total_gb": 0, "free_gb": 0, "used_pct": 0}
+
+
+def audio_cache_stats():
+    try:
+        fs = [os.path.join(AUDIO_DIR, f) for f in os.listdir(AUDIO_DIR)
+              if f.endswith(AUDIO_EXTS)]
+        return {"files": len(fs), "mb": round(sum(os.path.getsize(f) for f in fs) / 1048576, 1)}
+    except Exception:
+        return {"files": 0, "mb": 0}
+
+
+_last_disk_check = [0.0]
+
+
+def evict_audio(force=False):
+    """双重约束：文件数上限 + 体积上限；磁盘剩余过少时额外狠清。
+    返回是否真的删了东西。"""
+    now = time.time()
+    if not force and now - _last_disk_check[0] < DISK_CHECK_EVERY:
+        return False
+    _last_disk_check[0] = now
+    removed = 0
+    try:
+        fs = [os.path.join(AUDIO_DIR, f) for f in os.listdir(AUDIO_DIR)
+              if f.endswith(AUDIO_EXTS)]
+        if not fs:
+            return False
         fs.sort(key=os.path.getmtime)
-        for f in fs[:len(fs) - AUDIO_MAX_FILES]:
+        sizes = {}
+        try:
+            sizes = {f: os.path.getsize(f) for f in fs}
+        except Exception:
+            pass
+        du = disk_usage()
+        # 磁盘吃紧：把缓存砍到上限的四分之一，优先保命
+        if du["free_gb"] and du["free_gb"] < DISK_FREE_MIN_GB:
+            keep = max(30, AUDIO_MAX_FILES // 4)
+            print("[Enhancer] 磁盘剩 %.1fG(<%.0fG)，缓存收紧到 %d 首"
+                  % (du["free_gb"], DISK_FREE_MIN_GB, keep))
+            for f in fs[:max(0, len(fs) - keep)]:
+                try:
+                    os.remove(f)
+                    removed += 1
+                except Exception:
+                    pass
+            return removed > 0
+        over_files = max(0, len(fs) - AUDIO_MAX_FILES)
+        total = sum(sizes.values()) if sizes else 0
+        over_bytes = max(0, total - AUDIO_MAX_BYTES)
+        drop = over_files
+        acc = 0
+        for f in fs[over_files:]:
+            if acc >= over_bytes:
+                break
+            acc += sizes.get(f, 0)
+            drop += 1
+        for f in fs[:drop]:
             try:
                 os.remove(f)
+                removed += 1
             except Exception:
                 pass
-    except Exception:
-        pass
+        if removed:
+            print("[Enhancer] 缓存淘汰 %d 首（文件 %d/上限%d，体积 %.0fMB/上限%.0fMB）"
+                  % (removed, len(fs), AUDIO_MAX_FILES, total / 1048576,
+                     AUDIO_MAX_BYTES / 1048576))
+    except Exception as e:
+        print("[Enhancer] 缓存淘汰异常: %s" % str(e)[:70])
+    return removed > 0
 
 
 def fetch_to_disk(sid, up_url, expected=0, timeout=90):
@@ -1929,4 +2054,9 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 
 if __name__ == "__main__":
     print("[R-Music] Enhancer 启动 端口=%s 适配器=%s 换源=%s" % (PORT, GO_ADAPTER, FALLBACK_SOURCES))
+    du, ac = disk_usage(), audio_cache_stats()
+    print("[R-Music] 磁盘 %.0f%%（剩 %.1fG）缓存 %d 首 / %.0fMB"
+          % (du["used_pct"], du["free_gb"], ac["files"], ac["mb"]))
+    evict_audio(force=True)                      # 启动时先按水位清一次
+    threading.Thread(target=recheck_worker, daemon=True).start()   # 无音源主动复核
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
