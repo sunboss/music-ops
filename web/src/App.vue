@@ -82,8 +82,8 @@ function doSearch() {
         </RouterView>
       </div>
 
-      <!-- 桌面播放条 -->
-      <PlayerBar class="d-bar" />
+      <!-- 桌面播放条：需外层包裹，否则 PlayerBar 是多根组件、class 无法继承，手机端会与迷你条重叠 -->
+      <div class="d-bar"><PlayerBar /></div>
       <!-- 全屏播放器（桌面抽屉式 / 移动全屏，含歌词） -->
       <FullPlayer />
       <!-- 播放队列 -->
@@ -109,7 +109,7 @@ function doSearch() {
           padding: 6px 10px; border-radius: 16px; background: var(--fill); color: var(--fg2); }
 .search input { flex: 1; min-width: 0; border: 0; outline: 0; background: none; font-size: 13px; color: var(--fg); }
 .scroll { flex: 1; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; }
-.d-bar { display: none; }
+.d-bar { display: none !important; }
 .m-bottom { flex: none; padding-top: 4px; }
 .m-bottom :deep(.mini) { margin-bottom: 2px; }
 
@@ -127,8 +127,8 @@ function doSearch() {
   .sh { font-size: 11px; color: var(--fg3); padding: 18px 10px 5px; letter-spacing: .04em; }
   .qn { font-size: 12.5px; color: var(--fg2); padding: 2px 10px; text-align: left; border-radius: 6px; }
   .qn:hover { background: var(--fill); color: var(--fg); }
-  .d-bar { display: flex; }
-  .m-bottom { display: none; }
+  .d-bar { display: flex !important; }
+  .m-bottom { display: none !important; }
   .search { width: 300px; }
 }
 /* 手机端不显示顶栏标题：页面内的大标题已经足够，省出横向空间给搜索 */
