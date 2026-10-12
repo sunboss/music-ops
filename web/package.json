@@ -1,0 +1,32 @@
+{
+  "name": "r-music-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0",
+    "pinia": "^3.0.1",
+    "pinia-plugin-persistedstate": "^4.2.0",
+    "howler": "^2.2.4",
+    "vue-virtual-scroller": "^2.0.0-beta.8",
+    "lucide-vue-next": "^0.469.0",
+    "axios": "^1.7.9"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.0",
+    "vite": "^7.0.0",
+    "typescript": "^5.7.3",
+    "vue-tsc": "^2.2.0",
+    "tailwindcss": "^4.0.0",
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/howler": "^2.2.12",
+    "@types/node": "^22.10.5"
+  }
+}
