@@ -520,11 +520,9 @@ class H(BaseHTTPRequestHandler):
         if sid:
             hit = cache_get(sid)
             if hit and hit[0] == REJECT_MARK:
-                code, body = self._up("/song/url", query)
-                try:
-                    return self._json(200, strip_trial(json.loads(body.decode("utf-8"))))
-                except Exception:
-                    return self._json(200, {"code": 404, "data": []})
+                # 各来源都只有试听片段：仍然返回我们自己的地址（播放时会明确失败），
+                # 绝不返回 null —— 否则播放器会回落到网易云外链，只能听 30 秒
+                return self._json(200, {"code": 200, "data": [self._item(sid, 0, 0, "no-source")]})
             if hit:
                 _, size, br, src = hit
                 return self._json(200, {"code": 200, "data": [self._item(sid, size, br, src)]})
@@ -548,6 +546,7 @@ class H(BaseHTTPRequestHandler):
         name, artist, album, dur = song_detail(sid)
         if not name:
             return self._json(200, strip_trial(data) or {"code": 404, "data": []})
+        dur = dur or 0
 
         if off_url:
             try:
@@ -568,10 +567,10 @@ class H(BaseHTTPRequestHandler):
                                     "netease-outer", size=osz)
                 print("[Enhancer] 外链可用且体积达标 %s / %s (%d 字节)" % (name, artist, osz))
                 return self._json(200, {"code": 200, "data": [entry]})
-            print("[Enhancer] 未换源，保持不可播放: %s / %s (原因: %s, 外链 %d 字节判为片段)"
+            print("[Enhancer] 未换到完整音源: %s / %s (原因: %s, 外链 %d 字节判为片段) "
+                  "→ 仍返回自有代理地址，避免播放器回落网易云外链(30秒试听)"
                   % (name, artist, (res or {}).get("attempts"), osz))
-            # 官方/外链可能给的是试听片段，绝不能回填（否则只能听 30 秒）
-            return self._json(200, strip_trial(data) or {"code": 404, "data": []})
+            return self._json(200, {"code": 200, "data": [self._item(sid, 0, 0, "no-source")]})
         try:
             entry = build_entry(sid, res["url"], dur, "fallback")
             print("[Enhancer] 换源命中 %s / %s ← %s (%d 字节)" %
