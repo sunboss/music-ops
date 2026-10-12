@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { Pause, Play, SkipBack, SkipForward, Sparkles, Cast } from "lucide-vue-next";
-import CastSheet from "./CastSheet.vue";
+import CastMenu from "./CastMenu.vue";
 import { usePlayerStore } from "@/stores/player";
 import { useRouter } from "vue-router";
 import Cover from "./Cover.vue";
@@ -36,13 +36,18 @@ function seek(e: MouseEvent) {
     <button class="bt" @click="p.next()" :disabled="!p.hasQueue"><SkipForward :size="17" fill="currentColor" /></button>
     <div class="sp" />
     <div class="tm tnum">{{ fmt(p.progress) }} / {{ fmt(p.duration) }}</div>
-    <button class="cast" :class="{ on: !!p.castName }" :title="p.castName ? '正在投屏到 ' + p.castName : '投屏到音箱 / 电视'"
-            @click="p.showCast = true">
+    <!-- 投屏：直接弹设备勾选（Safari 走系统列表），不弹页面 -->
+    <button class="cast" :class="{ on: !!p.castName }"
+            :title="p.castName ? '正在投屏到 ' + p.castName + '（点击可停止/换设备）' : '投屏到音箱 / 电视'"
+            @click="p.quickCast()">
       <Cast :size="15" /><span v-if="p.castName" class="cn ellipsis">{{ p.castName }}</span>
     </button>
     <button class="ai" title="AI 一句话点歌" @click="router.push('/ai')"><Sparkles :size="14" /></button>
   </div>
-  <CastSheet v-if="p.showCast" />
+  <CastMenu v-if="p.showCast" />
+  <Transition name="toast">
+    <div v-if="p.toast" class="toast">{{ p.toast }}</div>
+  </Transition>
 </template>
 
 <style scoped>
@@ -58,6 +63,11 @@ function seek(e: MouseEvent) {
 .meta { min-width: 120px; max-width: 240px; }
 .nm { font-size: 13px; font-weight: 500; letter-spacing: -.01em; }
 .ar { font-size: 12px; color: var(--fg2); }
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(var(--bar-h) + 16px);
+         padding: 8px 16px; border-radius: 18px; background: var(--bg-elev); border: 0.5px solid var(--hair);
+         box-shadow: var(--shadow); font-size: 12.5px; color: var(--fg); z-index: 70; max-width: 80vw; }
+.toast-enter-active, .toast-leave-active { transition: opacity .18s, transform .18s; }
+.toast-enter-from, .toast-leave-to { opacity: 0; transform: translateX(-50%) translateY(6px); }
 .cast { display: inline-flex; align-items: center; gap: 6px; max-width: 150px; padding: 5px 10px;
          border-radius: 14px; color: var(--fg2); }
 .cast:hover { background: var(--fill); }

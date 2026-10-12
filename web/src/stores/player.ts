@@ -1,4 +1,5 @@
 import { defineStore } from "pinia";
+import { airplayActive, airplaySupported, castTargetName, remoteSupported, startCast, stopCast } from "@/utils/cast";
 import { api } from "@/api/client";
 import type { Song } from "@/api/types";
 import { parseLrc, type LyricLine } from "@/utils/lrc";
@@ -29,10 +30,11 @@ export const usePlayerStore = defineStore("player", {
     showQueue: false,         // 播放队列抽屉
     autoContinue: localStorage.getItem("autoContinue") !== "0",   // 无限电台：队列快空时 AI 自动续歌
     continuing: false,
-    showCast: false,          // 投屏面板
+    showCast: false,          // 备用设备小菜单（只有浏览器没有原生投屏能力时才出现）
     castMode: "off" as "off" | "airplay" | "remote" | "dlna" | "ha",   // 当前投屏通道
     castEntity: "",           // 经 HA 投屏时的实体 id
     castName: "",             // 正在投屏到的设备名
+    toast: "",                // 一行提示（不再是整页说明）
     lyrics: [] as LyricLine[],
     lyricFor: -1,
     ready: false,
@@ -107,6 +109,78 @@ export const usePlayerStore = defineStore("player", {
       const fresh = songs.filter((s) => s.id && !have.has(String(s.id)));
       if (fresh.length) this.queue = [...this.queue, ...fresh];
       return fresh.length;
+    },
+
+    /** 短暂提示一行字 */
+    flash(msg: string) {
+      this.toast = msg;
+      window.setTimeout(() => { if (this.toast === msg) this.toast = ""; }, 2600);
+    },
+
+    /** 从投屏元素回读状态：投到哪台设备、播放到哪 */
+    refreshCast() {
+      const on = airplayActive();
+      const name = castTargetName();
+      if (on) {
+        this.castMode = "airplay";
+        this.castName = name || "AirPlay 设备";
+      } else if (this.castMode === "airplay") {
+        this.castMode = "off";
+        this.castName = "";
+      }
+    },
+
+    /**
+     * 点投屏图标时的行为（用户要求：不要弹页面，直接弹设备勾选）。
+     * 有原生能力就用系统设备列表；没有才退化成一个小的设备菜单。
+     */
+    async quickCast() {
+      const song = this.current;
+      if (!song) { this.flash("先播一首歌再投屏"); return; }
+      const url = `${location.origin}/api/ma/play?id=${song.id}`;
+
+      if (this.castName) { this.showCast = true; return; }   // 已在投屏：给小菜单（含停止/换设备）
+
+      const hooks = {
+        onState: () => this.refreshCast(),
+        onTime: (cur: number, dur: number) => { this.progress = cur || 0; if (dur) this.duration = dur; },
+      };
+
+      if (airplaySupported()) {
+        // Safari：同步弹出系统设备列表（带勾选），一步到位
+        if (this.playing) this.toggle();                     // 先停本地，避免两边同时出声
+        startCast(url, hooks);
+        window.setTimeout(() => {
+          if (airplayActive()) return;
+          this.stopCastLocal();                              // 用户在系统列表里取消了
+          if (!this.playing) this.toggle();                  // 那就恢复本地播放
+          this.flash("已取消投屏");
+        }, 3000);
+        return;
+      }
+
+      if (remoteSupported()) {
+        // Chromium：remote.prompt 有时既不成功也不报错，加超时兜底，不让按钮像坏了
+        const r = startCast(url, hooks);
+        const done = await Promise.race([
+          r.then(() => "ok").catch(() => "err"),
+          new Promise((res) => window.setTimeout(() => res("hang"), 3000)),
+        ]);
+        this.refreshCast();
+        if (done !== "ok" && !this.castName) {
+          this.flash(done === "hang" ? "这台浏览器没弹出设备列表（AirPlay 设备要用 Safari）" : "投屏失败");
+          this.showCast = true;                              // 退化成小菜单，仍不是整页
+        }
+        return;
+      }
+      this.showCast = true;                                  // 浏览器无原生投屏能力
+    },
+
+    stopCastLocal() {
+      void stopCast();
+      this.castMode = "off";
+      this.castName = "";
+      this.castEntity = "";
     },
 
     setAutoContinue(on: boolean) {
