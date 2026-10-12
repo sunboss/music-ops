@@ -997,9 +997,11 @@ def prewarm_song(sid):
             if not name:
                 return
             cands = []
-            off, _sz = official_url(sid)
-            if is_http(off):
-                cands.append(off)
+            # ADR-1：网易云只当目录不负责出声 —— 主播放路径关了官方直链，预热也不能偷偷用
+            if ALLOW_OFFICIAL:
+                off, _sz = official_url(sid)
+                if is_http(off):
+                    cands.append(off)
             res = go_resolve(name, artist, album, dur)
             if is_http((res or {}).get("url")):
                 cands.append(res["url"])
@@ -1552,7 +1554,7 @@ def audio_ext(ctype, url):
     return ".mp3"
 
 
-AUDIO_MAX_BYTES = int(os.getenv("AUDIO_MAX_BYTES", str(2 * 1024 ** 3)))   # 缓存体积上限 2GB
+AUDIO_MAX_BYTES = int(os.getenv("AUDIO_MAX_BYTES", str(6 * 1024 ** 3)))   # 缓存体积上限 6GB（磁盘余量 24G）
 DISK_FREE_MIN_GB = float(os.getenv("DISK_FREE_MIN_GB", "8"))              # 剩余空间低于此值就狠清
 DISK_CHECK_EVERY = 300                                                    # 最快 5 分钟检查一次磁盘
 
@@ -2684,6 +2686,30 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         p = urllib.parse.urlparse(self.path)
         real = p.path[4:] if p.path.startswith("/api/") else p.path
+        if real == "/warmup":
+            # 批量预热：把一批歌提前落盘（点下去立刻响 / 弱网也能听）。
+            # 入参 {"ids":[...]} 或 {"playlist_id":"..."}；受 prewarm 限速保护（12 首/10 分钟）。
+            ln = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                d = json.loads((self.rfile.read(ln) if ln else b"{}").decode("utf-8", "ignore")) or {}
+            except Exception:
+                d = {}
+            ids = [str(x).strip() for x in (d.get("ids") or []) if str(x).strip()][:60]
+            if not ids and d.get("playlist_id"):
+                try:
+                    ids = [str(t.get("id")) for t in playlist_tracks(str(d["playlist_id"]), limit=50)
+                           if t.get("id")][:60]
+                except Exception:
+                    ids = []
+            if not ids:
+                return self._json(400, {"ok": False, "error": "no ids"})
+            # 已落盘的直接不算任务；其余逐首排队 prewarm（内部自带限速与去重）
+            todo = [i for i in ids if not audio_cached(i) and not is_unplayable(i)]
+            for i in todo:
+                threading.Thread(target=prewarm_song, args=(i,), daemon=True).start()
+            print("[Enhancer] 批量预热 %d 首（新任务 %d，已缓存 %d）"
+                  % (len(ids), len(todo), len(ids) - len(todo)))
+            return self._json(200, {"ok": True, "accepted": len(todo), "cached": len(ids) - len(todo)})
         if real == "/client-report":
             return self.handle_client_report()
         if real == "/ai/query":

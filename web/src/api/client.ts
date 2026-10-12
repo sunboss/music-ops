@@ -140,6 +140,12 @@ export const api = {
     return (data.favorites || []) as { id: string; name: string; artist: string; liked_at: number }[];
   },
 
+  /** 批量预热：把这批歌提前落到服务器本地盘（点下去立刻响） */
+  async warmup(ids: (number | string)[]) {
+    const { data } = await http.post("/warmup", { ids });
+    return data as { ok: boolean; accepted: number; cached: number };
+  },
+
   reportTaste(songId: number | string, action: "play" | "skip", played: number, dur: number) {
     return http.post("/client-report", { kind: "taste", id: String(songId), action, played, dur })
       .catch(() => void 0);

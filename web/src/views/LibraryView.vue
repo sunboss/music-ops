@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
-import { Play, History, Sparkles, ListMusic, Trash2, Heart, Radio } from "lucide-vue-next";
+import { Play, History, Sparkles, ListMusic, Trash2, Heart, Radio, Download } from "lucide-vue-next";
 import { readFavs, favSongs, toggleFav } from "@/utils/favorites";
 import { readHistory, clearHistory, type HistoryItem } from "@/utils/history";
 import { api } from "@/api/client";
@@ -15,6 +15,8 @@ const p = usePlayerStore();
 const tab = ref<"recent" | "fav" | "daily" | "playlist">("recent");
 const favs = ref(readFavs());
 const radioBusy = ref(false);
+const warmMsg = ref("");
+const warmBusy = ref(false);
 const history = ref<HistoryItem[]>(readHistory());
 const daily = ref<Song[]>([]);
 const playlists = ref<{ id: number; name: string; picUrl?: string; sub?: string }[]>([]);
@@ -71,6 +73,24 @@ async function favRadio() {
     const d = await api.aiRadio("像我收藏的那些歌", 15);
     if (d.songs?.length) p.playQueue(d.songs, 0);
   } finally { radioBusy.value = false; }
+}
+
+/** 离线保存：整批收藏提前落到服务器本地盘，点下去立刻响 */
+async function warmFavs() {
+  if (warmBusy.value || !favs.value.length) return;
+  warmBusy.value = true;
+  warmMsg.value = "保存中…";
+  try {
+    const r = await api.warmup(favs.value.map((f) => f.id));
+    warmMsg.value = r.accepted
+      ? `已加入保存队列 ${r.accepted} 首（新 ${r.accepted} / 已存 ${r.cached}）`
+      : `全部已保存（${r.cached} 首）`;
+  } catch {
+    warmMsg.value = "保存失败，稍后再试";
+  } finally {
+    warmBusy.value = false;
+    setTimeout(() => (warmMsg.value = ""), 6000);
+  }
 }
 
 function removeFav(id: number) {
@@ -131,7 +151,11 @@ onMounted(() => {
         <button class="ghost" :disabled="radioBusy" @click="favRadio">
           <Radio :size="14" />{{ radioBusy ? "生成中…" : "按收藏生成电台" }}
         </button>
+        <button class="ghost" :disabled="warmBusy" @click="warmFavs" title="提前下载到服务器，点播零等待">
+          <Download :size="14" />{{ warmBusy ? "保存中…" : "离线保存" }}
+        </button>
         <span class="cnt">{{ favs.length }} 首 · 会喂给 AI 推荐</span>
+        <span v-if="warmMsg" class="cnt warm-msg">{{ warmMsg }}</span>
       </div>
       <p v-if="!favs.length" class="tip">
         还没有收藏。在播放器上点红心就会记到这里 —— 收藏会喂给 AI，之后说一句「像我喜欢的」它就更准。
@@ -207,6 +231,7 @@ onMounted(() => {
 .nm { font-size: 14.5px; font-weight: 500; letter-spacing: -.012em; }
 .ar { font-size: 12.5px; color: var(--fg2); }
 .pb { width: 32px; height: 32px; display: grid; place-items: center; color: #ff375f; }
+.warm-msg { color: var(--accent); }
 .tip { padding: 26px 22px; color: var(--fg2); font-size: 13px; max-width: 520px; }
 @media (max-width: 640px) {
   .hero { padding: 16px 14px 8px; } .hero h1 { font-size: 24px; }
